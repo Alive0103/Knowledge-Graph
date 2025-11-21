@@ -1,8 +1,4 @@
-import os
-import json
-from elasticsearch import Elasticsearch
-
-es = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
+from 实体链接.es_client import es
 
 if es.indices.exists(index="data2"):
     es.indices.delete(index="data2")

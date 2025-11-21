@@ -1,9 +1,7 @@
 from flask import Flask, jsonify, request, Response
 import re
 import hashlib
-from elasticsearch import Elasticsearch
-
-es = Elasticsearch(["http://localhost:9200"])
+from 实体链接.es_client import es
 
 image_cache = {}
 

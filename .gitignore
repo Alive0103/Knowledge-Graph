@@ -175,3 +175,4 @@ Thumbs.db
 
 # LFS cache
 .lfsconfig
+/实体链接/model/chinese-roberta-wwm-ext/
