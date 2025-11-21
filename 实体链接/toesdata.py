@@ -216,6 +216,19 @@ def transform_military_data(data):
     descriptions_zh = data.get("zh_description") or data.get("descriptions_zh", "")
     content = data.get("content", "")
     
+    # 如果内容是HTML，尝试提取纯文本
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(content, 'html.parser')
+        # 提取所有文本内容
+        text_content = soup.get_text()
+        # 移除多余的空白字符
+        text_content = ' '.join(text_content.split())
+        content = text_content
+    except Exception as e:
+        # 如果解析失败，保持原内容
+        pass
+    
     # 向量字段（可选，需要验证维度）
     zh_vector = data.get("zh_descriptions_vector") or data.get("descriptions_zh_vector")
     en_vector = data.get("en_descriptions_vector") or data.get("descriptions_en_vector")
