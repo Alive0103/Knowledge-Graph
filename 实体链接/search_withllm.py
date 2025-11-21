@@ -1,24 +1,32 @@
-import json
 import torch
 from transformers import BertTokenizer, BertModel
-from elasticsearch import Elasticsearch
 import pandas as pd
 from tqdm import tqdm
 from zhipuai import ZhipuAI
 import concurrent.futures
-from tqdm import tqdm
+from 实体链接.es_client import es
 
-es = Elasticsearch(["http://localhost:9200"])
-
+# 模型加载（用于向量生成，当前代码中向量检索部分被注释，所以模型是可选的）
+# 如果需要使用向量检索功能，需要下载模型
 model_name = 'D:/model/chinese-roberta-wwm-ext-large'
-tokenizer = BertTokenizer.from_pretrained(model_name)
-model = BertModel.from_pretrained(model_name)
-model.eval()
+model = None
+tokenizer = None
+try:
+    tokenizer = BertTokenizer.from_pretrained(model_name)
+    model = BertModel.from_pretrained(model_name)
+    model.eval()
+    print("✓ Chinese-RoBERTa模型加载成功")
+except Exception as e:
+    print(f"警告: 模型加载失败 ({e})，向量生成功能将不可用")
+    print("提示: 模型是可选的，如果不使用向量检索，可以跳过")
 
+# 智谱AI API客户端（必需，用于LLM重排序功能）
+# API密钥获取：https://open.bigmodel.cn/
 client = ZhipuAI(api_key="dab23a7b3db0459dbeb2a1e1941721a3.qbD9kfVvLcHfFrtc")  
 
 def generate_vector(text):
-    if text:
+    """生成文本向量（需要模型已加载）"""
+    if text and model is not None and tokenizer is not None:
         inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
         with torch.no_grad():
             outputs = model(**inputs)
@@ -71,7 +79,19 @@ def hybrid_search(query_text, top_k=20):
         # ],
         "size": top_k
     }
-    response = es.search(index="data1", body=search_query)
+    # 尝试多个索引名称
+    index_names = ["data2", "data1"]
+    response = None
+    for index_name in index_names:
+        try:
+            if es.indices.exists(index=index_name):
+                response = es.search(index=index_name, body=search_query)
+                break
+        except:
+            continue
+    
+    if response is None:
+        raise Exception(f"未找到可用的索引，尝试过的索引: {index_names}")
     hits = response["hits"]["hits"]
     # results = [hit["_source"] for hit in hits]
     results = [
@@ -222,14 +242,64 @@ def calculate_metrics(queries, correct_links):
 
     return mrr, hit_at_1, hit_at_5, hit_at_10
 
+def test_search():
+    """测试搜索功能（不需要评测文件）"""
+    print("=" * 50)
+    print("测试LLM增强搜索功能")
+    print("=" * 50)
+    
+    test_queries = ["AK47", "F-16战斗机", "步枪"]
+    
+    for query in test_queries:
+        try:
+            print(f"\n查询: '{query}'")
+            results = hybrid_search(query, top_k=5)
+            print(f"找到 {len(results)} 个候选实体")
+            
+            # 显示前3个结果
+            for i, result in enumerate(results[:3], 1):
+                print(f"  {i}. {result.get('label', 'N/A')}")
+                print(f"     链接: {result.get('link', 'N/A')}")
+            
+            # 使用LLM重排序（需要API密钥）
+            print(f"\n使用LLM重排序...")
+            sorted_links = generate_prompt_and_sort(query, results)
+            print(f"重排序后的前3个结果:")
+            for i, link in enumerate(sorted_links[:3], 1):
+                print(f"  {i}. {link}")
+        except Exception as e:
+            print(f"查询 '{query}' 失败: {e}")
+            import traceback
+            traceback.print_exc()
+
 def main():
+    import os
+    
     file_path = "find.xlsx"
-    queries, correct_links = read_excel(file_path)
-    mrr, hit_at_1, hit_at_5, hit_at_10 = calculate_metrics(queries, correct_links)
-    print(f"MRR: {mrr:.4f}")
-    print(f"Hit@1: {hit_at_1:.4f}")
-    print(f"Hit@5: {hit_at_5:.4f}")
-    print(f"Hit@10: {hit_at_10:.4f}")
+    
+    # 如果评测文件不存在，运行测试搜索
+    if not os.path.exists(file_path):
+        print(f"未找到评测文件: {file_path}")
+        print("运行测试搜索模式...\n")
+        test_search()
+        return
+    
+    try:
+        queries, correct_links = read_excel(file_path)
+        print(f"读取了 {len(queries)} 个查询")
+        print("开始评测（使用LLM重排序）...")
+        mrr, hit_at_1, hit_at_5, hit_at_10 = calculate_metrics(queries, correct_links)
+        print(f"\n{'='*50}")
+        print("评测结果:")
+        print(f"{'='*50}")
+        print(f"MRR: {mrr:.4f}")
+        print(f"Hit@1: {hit_at_1:.4f}")
+        print(f"Hit@5: {hit_at_5:.4f}")
+        print(f"Hit@10: {hit_at_10:.4f}")
+    except Exception as e:
+        print(f"评测失败: {e}")
+        print("\n运行测试搜索模式...\n")
+        test_search()
 
 if __name__ == "__main__":
     main()
