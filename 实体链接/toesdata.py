@@ -3,6 +3,16 @@ from elasticsearch import helpers
 from tqdm import tqdm
 import time
 from es_client import es
+import logging
+
+# 设置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='import_log.txt',
+    filemode='a'
+)
+logger = logging.getLogger(__name__)
 
 INDEX_RELINK = "data2_relink"
 INDEX_IMAGE = "data2_image"
@@ -35,6 +45,10 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
     start_time = time.time()
     current_batch_size = 0  # 当前批次的数据大小（字节）
 
+    # 记录导入前的文档数量
+    doc_count_before = get_document_count(index_name) or 0
+    print(f"导入前索引 '{index_name}' 中的文档数量: {doc_count_before}")
+
     with open(input_file, "r", encoding="utf-8") as f:
         # 使用tqdm显示进度
         progress_bar = tqdm(total=total_lines, desc="导入进度", unit="条", mininterval=0.5)
@@ -56,6 +70,7 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                     # 如果单条数据超过 1MB，跳过（避免超过限制）
                     if data_size > 1024 * 1024:
                         tqdm.write(f"警告: 第{line_num}行数据过大 ({data_size/1024:.1f}KB)，跳过")
+                        logger.warning(f"第{line_num}行数据过大 ({data_size/1024:.1f}KB)，跳过")
                         failed_count += 1
                         progress_bar.update(1)
                         continue
@@ -67,6 +82,7 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                         # 先提交当前批次
                         try:
                             tqdm.write(f"批次大小达到限制，提前提交 (共{len(actions)}条)...")
+                            logger.info(f"批次大小达到限制，提前提交 (共{len(actions)}条)...")
                             success, failed = helpers.bulk(
                                 es.options(request_timeout=request_timeout), 
                                 actions,
@@ -83,6 +99,7 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                             current_batch_size = 0
                         except Exception as e:
                             tqdm.write(f"提前提交批次失败: {e}")
+                            logger.error(f"提前提交批次失败: {e}")
                             failed_count += len(actions)
                             actions = []
                             current_batch_size = 0
@@ -99,16 +116,19 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                 progress_bar.update(1)
                 if failed_count <= 5:  # 只显示前5个错误
                     tqdm.write(f"警告: 第{line_num}行JSON解析失败: {e}")
+                    logger.warning(f"第{line_num}行JSON解析失败: {e}")
             except Exception as e:
                 failed_count += 1
                 progress_bar.update(1)
                 if failed_count <= 5:
                     tqdm.write(f"警告: 第{line_num}行处理失败: {e}")
+                    logger.warning(f"第{line_num}行处理失败: {e}")
 
             # 当达到批次大小时，批量导入
             if len(actions) >= batch_size:
                 try:
                     tqdm.write(f"正在导入批次 (共{len(actions)}条)...")
+                    logger.info(f"正在导入批次 (共{len(actions)}条)...")
                     success, failed = helpers.bulk(
                         es.options(request_timeout=request_timeout), 
                         actions,
@@ -120,12 +140,14 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                         # 显示详细的错误信息
                         error_count = len(failed)
                         tqdm.write(f"⚠ 批次中有 {error_count} 条失败")
+                        logger.warning(f"批次中有 {error_count} 条失败")
                         # 显示前3个错误的详细信息
                         for i, item in enumerate(failed[:3]):
                             error_info = item.get('index', {}).get('error', {})
                             error_type = error_info.get('type', 'unknown')
                             error_reason = error_info.get('reason', 'unknown')
                             tqdm.write(f"  错误 {i+1}: {error_type} - {error_reason[:100]}")
+                            logger.warning(f"错误 {i+1}: {error_type} - {error_reason[:100]}")
                         if error_count > 3:
                             tqdm.write(f"  ... 还有 {error_count - 3} 个错误")
                         failed_count += error_count
@@ -133,11 +155,13 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                     else:
                         total_imported += len(actions)
                         tqdm.write(f"✓ 成功导入 {len(actions)} 条")
+                        logger.info(f"成功导入 {len(actions)} 条")
                     
                     actions = []
                     current_batch_size = 0
                 except Exception as e:
                     tqdm.write(f"错误: 批量导入异常: {e}")
+                    logger.error(f"批量导入异常: {e}")
                     failed_count += len(actions)
                     actions = []
                     current_batch_size = 0
@@ -147,6 +171,7 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
         if actions:
             try:
                 tqdm.write(f"正在导入最后一批 (共{len(actions)}条)...")
+                logger.info(f"正在导入最后一批 (共{len(actions)}条)...")
                 success, failed = helpers.bulk(
                     es.options(request_timeout=request_timeout), 
                     actions,
@@ -157,30 +182,75 @@ def import_data_to_es(input_file, index_name, transform_func, batch_size=100, re
                 if failed:
                     error_count = len(failed)
                     tqdm.write(f"⚠ 最后一批中有 {error_count} 条失败")
+                    logger.warning(f"最后一批中有 {error_count} 条失败")
                     for i, item in enumerate(failed[:3]):
                         error_info = item.get('index', {}).get('error', {})
                         error_type = error_info.get('type', 'unknown')
                         error_reason = error_info.get('reason', 'unknown')
                         tqdm.write(f"  错误 {i+1}: {error_type} - {error_reason[:100]}")
+                        logger.warning(f"错误 {i+1}: {error_type} - {error_reason[:100]}")
                     failed_count += error_count
                     total_imported += (len(actions) - error_count)
                 else:
                     total_imported += len(actions)
                     tqdm.write(f"✓ 成功导入最后 {len(actions)} 条")
+                    logger.info(f"成功导入最后 {len(actions)} 条")
             except Exception as e:
                 tqdm.write(f"错误: 最后一批导入异常: {e}")
+                logger.error(f"最后一批导入异常: {e}")
                 failed_count += len(actions)
         
         progress_bar.close()
 
     elapsed_time = time.time() - start_time
+    
+    # 获取导入后的文档数量
+    doc_count_after = get_document_count(index_name) or 0
+    actual_imported = doc_count_after - doc_count_before
+    
     print(f"\n{'='*50}")
     print(f"导入完成！")
+    print(f"本次尝试导入: {total_imported + failed_count} 条")
     print(f"成功导入: {total_imported} 条")
+    print(f"实际新增文档数: {actual_imported} 条")
     print(f"失败/跳过: {failed_count} 条")
+    print(f"导入前索引中文档数: {doc_count_before}")
+    print(f"导入后索引中文档数: {doc_count_after}")
     print(f"总耗时: {elapsed_time:.2f} 秒")
     print(f"平均速度: {total_imported/elapsed_time:.2f} 条/秒" if elapsed_time > 0 else "")
     print(f"{'='*50}")
+    
+    # 记录导入完成日志
+    logger.info(f"导入完成！成功导入: {total_imported} 条, 失败/跳过: {failed_count} 条, 总耗时: {elapsed_time:.2f} 秒")
+
+def get_document_count(index_name):
+    """
+    获取指定索引中的文档数量
+    """
+    try:
+        # 使用 count API 获取文档数量
+        response = es.count(index=index_name)
+        return response["count"]
+    except Exception as e:
+        # 只对存在的索引报错进行记录，忽略索引不存在的错误
+        if "index_not_found_exception" not in str(e):
+            print(f"获取索引 {index_name} 的文档数量时出错：{e}")
+            logger.error(f"获取索引 {index_name} 的文档数量时出错：{e}")
+        return None
+
+def show_index_stats():
+    """
+    显示所有相关索引的文档数量统计
+    """
+    indices = [INDEX_RELINK, INDEX_IMAGE, INDEX_MILITARY]
+    print("\n索引文档数量统计:")
+    print("-" * 30)
+    for index in indices:
+        count = get_document_count(index)
+        if count is not None:
+            print(f"{index}: {count} 条文档")
+        else:
+            print(f"{index}: 尚未创建或无法访问")
 
 def transform_relink_data(data):
     """
@@ -288,39 +358,13 @@ if __name__ == "__main__":
         exit(1)
     
     # 如果索引已存在，可以选择清空
-    # if es.indices.exists(index=INDEX_MILITARY):
-    #     es.delete_by_query(index=INDEX_MILITARY, body={"query": {"match_all": {}}}, refresh=True)
-    #     print(f"索引 {INDEX_MILITARY} 中的所有数据已被清空。")
+    if es.indices.exists(index=INDEX_MILITARY):
+        es.delete_by_query(index=INDEX_MILITARY, body={"query": {"match_all": {}}}, refresh=True)
+        print(f"索引 {INDEX_MILITARY} 中的所有数据已被清空。")
 
     # import_data_to_es("data2_relink.jsonl", INDEX_RELINK, transform_relink_data)
     # import_data_to_es("data2_images.jsonl", INDEX_IMAGE, transform_image_data)
     import_data_to_es(data_file, INDEX_MILITARY, transform_military_data)
-
-
-# from elasticsearch import Elasticsearch
-
-# ES_HOST = "http://localhost:9200"  
-# es = Elasticsearch([ES_HOST])
-
-# INDEX_RELINK = "data1_relink"
-# INDEX_IMAGE = "data1_image"
-# INDEX_MILITARY = "data1"
-
-# def get_document_count(index_name):
-#     try:
-#         # 使用 count API 获取文档数量
-#         response = es.count(index=index_name)
-#         return response["count"]
-#     except Exception as e:
-#         print(f"获取索引 {index_name} 的文档数量时出错：{e}")
-#         return None
-
-# def main():
-#     indices = [INDEX_RELINK, INDEX_IMAGE, INDEX_MILITARY]
-#     for index in indices:
-#         count = get_document_count(index)
-#         if count is not None:
-#             print(f"索引 {index} 中的文档数量：{count}")
-
-# if __name__ == "__main__":
-#     main()
+    
+    # 显示导入后的索引统计信息
+    show_index_stats()

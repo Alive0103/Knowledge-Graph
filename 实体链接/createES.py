@@ -1,5 +1,6 @@
 from 实体链接.es_client import es
 
+# 创建 data2 索引（主索引）
 if es.indices.exists(index="data2"):
     es.indices.delete(index="data2")
 
@@ -160,50 +161,44 @@ index_settings = {
 }
 
 es.indices.create(index="data2", body=index_settings)
-print("成功创建索引 ")
+print("成功创建索引 data2")
 
-# import base64
-# from elasticsearch import Elasticsearch
+# 创建 data2_relink 索引
+index_relink_mapping = {
+    "mappings": {
+        "properties": {
+            "relink_url": {
+                "type": "keyword" 
+            },
+            "relink_data": {
+                "type": "text"  
+            }
+        }
+    }
+}
 
-# es = Elasticsearch("http://localhost:9200")
+if es.indices.exists(index="data2_relink"):
+    es.indices.delete(index="data2_relink")
 
-# index_b_mapping = {
-#     "mappings": {
-#         "properties": {
-#             "image_url": {
-#                 "type": "keyword"  
-#             },
-#             "image_data": {
-#                 "type": "text"  
-#             }
-#         }
-#     }
-# }
+es.indices.create(index="data2_relink", body=index_relink_mapping)
+print("成功创建索引 data2_relink")
 
-# index_a_mapping = {
-#     "mappings": {
-#         "properties": {
-#             "relink_url": {
-#                 "type": "keyword" 
-#             },
-#             "relink_data": {
-#                 "type": "text"  
-#             }
-#         }
-#     }
-# }
+# 创建 data2_image 索引
+index_image_mapping = {
+    "mappings": {
+        "properties": {
+            "image_url": {
+                "type": "keyword"  
+            },
+            "image_data": {
+                "type": "text"  
+            }
+        }
+    }
+}
 
-# if not es.indices.exists(index="demo_image"):
-#     es.indices.create(index="demo_image", body=index_b_mapping)
-#     print("索引图片已成功创建")
-# else:
-#     print("索引图片已存在")
+if es.indices.exists(index="data2_image"):
+    es.indices.delete(index="data2_image")
 
-
-# if not es.indices.exists(index="demo_relink"):
-#     es.indices.create(index="demo_relink", body=index_a_mapping)
-#     print("索引页面已成功创建")
-# else:
-#     print("索引页面已存在")
-
-
+es.indices.create(index="data2_image", body=index_image_mapping)
+print("成功创建索引 data2_image")
