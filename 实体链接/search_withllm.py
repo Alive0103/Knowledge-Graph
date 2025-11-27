@@ -175,10 +175,28 @@ def hybrid_search(query_text, top_k=20, text_boost=1.0, vector_boost=0.8, use_ve
         try:
             # 使用LLM生成规范化定义
             response_content = get_alias_and_definition(query_text)
-            input_definition = response_content.split("定义：")[1].strip()
+            # 更健壮的解析：支持多种格式
+            if "定义：" in response_content:
+                input_definition = response_content.split("定义：")[1].strip()
+                # 移除可能的后续内容（如换行、其他标签等）
+                input_definition = input_definition.split("\n")[0].split("标签：")[0].strip()
+            elif "定义" in response_content:
+                # 尝试没有冒号的格式
+                parts = response_content.split("定义")
+                if len(parts) > 1:
+                    input_definition = parts[1].strip().lstrip("：").lstrip(":").strip()
+                    input_definition = input_definition.split("\n")[0].split("标签：")[0].strip()
+                else:
+                    raise ValueError("无法从LLM响应中提取定义")
+            else:
+                raise ValueError("LLM响应中未找到定义字段")
+            
+            if not input_definition:
+                raise ValueError("提取的定义为空")
+            
             query_vector = generate_vector(input_definition, use_cache=True)
         except (ValueError, IndexError, Exception) as e:
-            # 如果LLM失败，使用原始查询文本生成向量
+            # 如果LLM失败，使用原始查询文本生成向量（静默失败，不打印错误）
             try:
                 query_vector = generate_vector(query_text, use_cache=True)
             except Exception as e2:
@@ -283,16 +301,79 @@ def get_alias_and_definition(mention):
     
     return response_content
 
+# 全局错误回调函数（用于详细评测）
+_error_callback = None
+
+def set_error_callback(callback):
+    """设置错误回调函数，用于详细评测时记录错误"""
+    global _error_callback
+    _error_callback = callback
+
 def generate_prompt_and_sort(mention, results):
     input_label = mention
     response_content = ""
     try:
         response_content = get_alias_and_definition(mention)
-        input_aliases_zh = response_content.split("中文别名：")[1].split("英文别名")[0].strip()
-        input_aliases_en = response_content.split("英文别名：")[1].split("定义")[0].strip()
-        input_definition = response_content.split("定义：")[1].strip()
+        
+        # 更健壮的解析：支持多种格式和缺失字段
+        def safe_extract(content, field_name, default=""):
+            """安全提取字段内容"""
+            # 尝试带冒号的格式
+            if f"{field_name}：" in content:
+                parts = content.split(f"{field_name}：", 1)
+                if len(parts) > 1:
+                    value = parts[1].split("英文别名")[0].split("定义")[0].split("\n")[0].strip()
+                    return value if value else default
+            # 尝试不带冒号的格式
+            elif field_name in content:
+                # 简单匹配，提取字段后的内容
+                idx = content.find(field_name)
+                if idx != -1:
+                    start = idx + len(field_name)
+                    # 跳过可能的冒号或空格
+                    while start < len(content) and content[start] in [":", "：", " ", "\t"]:
+                        start += 1
+                    # 提取到下一个字段或换行
+                    end = len(content)
+                    for marker in ["英文别名", "定义", "\n", "标签"]:
+                        marker_idx = content.find(marker, start)
+                        if marker_idx != -1 and marker_idx < end:
+                            end = marker_idx
+                    value = content[start:end].strip()
+                    return value if value else default
+            return default
+        
+        input_aliases_zh = safe_extract(response_content, "中文别名", "")
+        input_aliases_en = safe_extract(response_content, "英文别名", "")
+        input_definition = safe_extract(response_content, "定义", "")
+        
+        # 如果所有字段都为空，说明解析失败
+        if not input_aliases_zh and not input_aliases_en and not input_definition:
+            raise ValueError("无法从LLM响应中提取任何有效字段")
+            
     except (ValueError, IndexError, Exception) as e:
-        print(f"LLM failed to generate valid response for mention '{mention}'. Error: {e}")
+        # 记录详细错误信息
+        error_info = {
+            "type": "llm_parse_error",
+            "mention": mention,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "response_content": response_content[:500] if 'response_content' in locals() and response_content else None
+        }
+        
+        # 调用错误回调（如果设置了）
+        if _error_callback:
+            try:
+                _error_callback("llm_parse_error", mention, str(e), error_info)
+            except:
+                pass
+        
+        # 只在调试模式下打印详细错误，避免输出过多
+        import os
+        if os.getenv("DEBUG_LLM", "0") == "1":
+            print(f"LLM failed to generate valid response for mention '{mention}'. Error: {e}")
+            print(f"  Response content: {response_content[:200] if 'response_content' in locals() else 'N/A'}")
+        
         return [result['link'] for result in results]  
 
     options = []
@@ -333,7 +414,26 @@ def generate_prompt_and_sort(mention, results):
         sorted_links = ensure_links_match(sorted_links_raw, original_links)
         return sorted_links
     except Exception as e:
-        print(f"LLM failed to sort links for mention '{mention}'. Error: {e}")
+        # 记录详细错误信息
+        error_info = {
+            "type": "llm_sort_error",
+            "mention": mention,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "results_count": len(results)
+        }
+        
+        # 调用错误回调（如果设置了）
+        if _error_callback:
+            try:
+                _error_callback("llm_sort_error", mention, str(e), error_info)
+            except:
+                pass
+        
+        import os
+        if os.getenv("DEBUG_LLM", "0") == "1":
+            print(f"LLM failed to sort links for mention '{mention}'. Error: {e}")
+        
         return original_links  
     
 def normalize_url(url):

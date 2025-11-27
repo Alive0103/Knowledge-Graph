@@ -1,4 +1,4 @@
-from 实体链接.es_client import es
+from es_client import es
 
 # 创建 data2 索引（主索引）
 if es.indices.exists(index="data2"):
