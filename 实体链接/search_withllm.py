@@ -5,20 +5,32 @@ from tqdm import tqdm
 from zhipuai import ZhipuAI
 import concurrent.futures
 import re
+import numpy as np
+from functools import lru_cache
 from urllib.parse import quote, unquote
 from 实体链接.es_client import es
 
-# 模型加载（用于向量生成，当前代码中向量检索部分被注释，所以模型是可选的）
-# 如果需要使用向量检索功能，需要下载模型
-model_name = './model/chinese-roberta-wwm-ext'
+# 模型加载（用于向量生成）
+# 支持两种模型：
+# - chinese-roberta-wwm-ext: 768维
+# - chinese-roberta-wwm-ext-large: 1024维（推荐，与ES向量字段维度匹配）
+model_name = './model/chinese-roberta-wwm-ext-large'
 # model_name = 'D:/model/chinese-roberta-wwm-ext-large'
+# model_name = './model/chinese-roberta-wwm-ext'  # 768维模型
 model = None
 tokenizer = None
+model_dimension = None  # 模型向量维度
 try:
     tokenizer = BertTokenizer.from_pretrained(model_name)
     model = BertModel.from_pretrained(model_name)
     model.eval()
-    print("✓ Chinese-RoBERTa模型加载成功")
+    # 获取模型隐藏层维度
+    model_dimension = model.config.hidden_size
+    print(f"✓ Chinese-RoBERTa模型加载成功 (维度: {model_dimension})")
+    if model_dimension == 1024:
+        print("  ✓ 模型维度与ES向量字段匹配（1024维）")
+    elif model_dimension == 768:
+        print("  ⚠ 模型维度为768维，将自动扩展到1024维以匹配ES字段")
 except Exception as e:
     print(f"警告: 模型加载失败 ({e})，向量生成功能将不可用")
     print("提示: 模型是可选的，如果不使用向量检索，可以跳过")
@@ -27,70 +39,210 @@ except Exception as e:
 # API密钥获取：https://open.bigmodel.cn/
 client = ZhipuAI(api_key="1a2a485fe1fc4bd5aa0d965bf452c8c8.se8RZdT8cH8skEDo")
 
-def generate_vector(text):
-    """生成文本向量（需要模型已加载）"""
-    if text and model is not None and tokenizer is not None:
-        inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
-        with torch.no_grad():
-            outputs = model(**inputs)
-        vector = outputs.last_hidden_state[:, 0, :].squeeze().numpy()
-        return vector.tolist()
-    return None
+# 向量缓存字典（用于缓存生成的向量）
+_vector_cache = {}
+_cache_max_size = 1000
 
-def hybrid_search(query_text, top_k=20):
-    # try:
-    #     response_content = get_alias_and_definition(query_text)
-    #     input_definition = response_content.split("定义：")[1].strip()
-    #     query_vector = generate_vector(input_definition)
-    #     use_llm = True  
-    # except (ValueError, IndexError) as e:
-    #     print(f"Failed to get alias and definition from LLM: {e}. Falling back to original query text.")
-    #     query_vector = generate_vector(query_text)
-    #     use_llm = False  
+def _generate_vector_internal(text):
+    """
+    内部向量生成函数（实际生成向量）
+    
+    自动处理不同维度的模型：
+    - 1024维模型：直接使用，无需转换
+    - 768维模型：零填充到1024维
+    - 其他维度：自动调整到1024维
+    """
+    if model is None or tokenizer is None:
+        return None
+    
+    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    vector = outputs.last_hidden_state[:, 0, :].squeeze().numpy()
+    
+    # L2归一化
+    norm = np.linalg.norm(vector)
+    if norm > 0:
+        vector = vector / norm
+    
+    # 处理维度问题：ES需要1024维向量
+    # 如果模型是1024维（large模型），直接使用
+    # 如果模型是768维（base模型），需要扩展到1024维
+    vector_dim = len(vector)
+    target_dim = 1024  # ES向量字段维度
+    
+    if vector_dim == target_dim:
+        # 维度匹配，直接使用（large模型的情况）
+        pass
+    elif vector_dim == 768:
+        # 768维模型，零填充到1024维
+        vector = np.pad(vector, (0, target_dim - vector_dim), 'constant', constant_values=0)
+        # 重新归一化
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+    else:
+        # 其他维度，自动调整
+        if vector_dim < target_dim:
+            vector = np.pad(vector, (0, target_dim - vector_dim), 'constant', constant_values=0)
+        else:
+            vector = vector[:target_dim]
+        # 重新归一化
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+    
+    return vector.tolist()
 
-    search_query = {
-        "query": {
-            "bool": {
-                "should": [
-                    {
-                        "match": {
-                            "label": {
-                                "query": query_text,
-                                "boost": 1.0
-                            }
+def generate_vector(text, use_cache=True):
+    """
+    生成文本向量（需要模型已加载）
+    
+    Args:
+        text: 输入文本
+        use_cache: 是否使用缓存（默认True）
+    
+    Returns:
+        1024维向量列表，已L2归一化
+    """
+    if not text or model is None or tokenizer is None:
+        return None
+    
+    # 使用缓存
+    if use_cache:
+        cache_key = text
+        if cache_key in _vector_cache:
+            return _vector_cache[cache_key]
+        
+        # 生成向量
+        vector = _generate_vector_internal(text)
+        
+        # 添加到缓存（如果缓存已满，删除最旧的）
+        if len(_vector_cache) >= _cache_max_size:
+            # 删除第一个（FIFO）
+            first_key = next(iter(_vector_cache))
+            del _vector_cache[first_key]
+        
+        _vector_cache[cache_key] = vector
+        return vector
+    else:
+        # 不使用缓存，直接生成
+        return _generate_vector_internal(text)
+
+def hybrid_search(query_text, top_k=20, text_boost=1.0, vector_boost=0.8, use_vector=True):
+    """
+    混合检索：文本检索 + 向量检索
+    
+    Args:
+        query_text: 查询文本
+        top_k: 返回结果数量
+        text_boost: 文本检索的boost权重（默认1.0）
+        vector_boost: 向量检索的boost权重（默认0.8）
+        use_vector: 是否使用向量检索（默认True）
+    
+    Returns:
+        检索结果列表
+    """
+    # 构建文本检索查询
+    text_query = {
+        "bool": {
+            "should": [
+                {
+                    "match": {
+                        "label": {
+                            "query": query_text,
+                            "boost": text_boost
                         }
-                    },
-                    {
-                        "match": {
-                            "aliases_zh": {
-                                "query": query_text,
-                                "boost": 1.0
-                            }
+                    }
+                },
+                {
+                    "match": {
+                        "aliases_zh": {
+                            "query": query_text,
+                            "boost": text_boost
                         }
-                    },
-                ]
-            }
-        },
-        # "knn": [
-        #     {
-        #         "field": "descriptions_zh_vector",
-        #         "query_vector": query_vector,
-        #         "k": 10,
-        #         "num_candidates": 20,
-        #         "boost": 1.0
-        #     }
-        # ],
-        "size": top_k
+                    }
+                },
+            ]
+        }
     }
+    
+    # 尝试生成查询向量（使用LLM生成的规范化定义）
+    query_vector = None
+    knn_query = None
+    
+    if use_vector and model is not None and tokenizer is not None:
+        try:
+            # 使用LLM生成规范化定义
+            response_content = get_alias_and_definition(query_text)
+            input_definition = response_content.split("定义：")[1].strip()
+            query_vector = generate_vector(input_definition, use_cache=True)
+        except (ValueError, IndexError, Exception) as e:
+            # 如果LLM失败，使用原始查询文本生成向量
+            try:
+                query_vector = generate_vector(query_text, use_cache=True)
+            except Exception as e2:
+                # 向量生成失败，仅使用文本检索
+                query_vector = None
+        
+        # 如果成功生成向量，构建KNN查询
+        if query_vector is not None:
+            # 优先使用content_vector（包含完整页面内容）
+            # 如果content_vector字段不存在或为空，ES查询会失败，需要回退到descriptions_zh_vector
+            # 这里先尝试content_vector，如果失败会在ES查询时捕获异常并回退
+            knn_query = {
+                "field": "content_vector",  # 优先使用content_vector
+                "query_vector": query_vector,
+                "k": 10,
+                "num_candidates": 20,
+                "boost": vector_boost
+            }
+    
+    # 构建混合查询
+    if knn_query:
+        # 使用hybrid query（文本 + 向量）
+        search_query = {
+            "query": text_query,
+            "knn": knn_query,
+            "size": top_k
+        }
+    else:
+        # 仅使用文本检索
+        search_query = {
+            "query": text_query,
+            "size": top_k
+        }
     # 尝试多个索引名称
     index_names = ["data2", "data1"]
     response = None
     for index_name in index_names:
         try:
             if es.indices.exists(index=index_name):
-                response = es.search(index=index_name, body=search_query)
+                # 如果使用向量检索，先尝试content_vector，失败则回退到descriptions_zh_vector
+                if knn_query and knn_query.get("field") == "content_vector":
+                    try:
+                        response = es.search(index=index_name, body=search_query)
+                    except Exception as e:
+                        # content_vector字段可能不存在或为空，回退到descriptions_zh_vector
+                        if "content_vector" in str(e).lower() or "field" in str(e).lower():
+                            # 修改knn_query使用descriptions_zh_vector
+                            search_query["knn"]["field"] = "descriptions_zh_vector"
+                            try:
+                                response = es.search(index=index_name, body=search_query)
+                            except Exception as e2:
+                                # 如果descriptions_zh_vector也失败，移除knn查询，仅使用文本检索
+                                search_query = {
+                                    "query": text_query,
+                                    "size": top_k
+                                }
+                                response = es.search(index=index_name, body=search_query)
+                        else:
+                            raise e
+                else:
+                    response = es.search(index=index_name, body=search_query)
                 break
-        except:
+        except Exception as e:
+            # 如果所有尝试都失败，继续尝试下一个索引
             continue
     
     if response is None:
