@@ -4,11 +4,14 @@ import pandas as pd
 from tqdm import tqdm
 from zhipuai import ZhipuAI
 import concurrent.futures
+import re
+from urllib.parse import quote, unquote
 from 实体链接.es_client import es
 
 # 模型加载（用于向量生成，当前代码中向量检索部分被注释，所以模型是可选的）
 # 如果需要使用向量检索功能，需要下载模型
-model_name = 'D:/model/chinese-roberta-wwm-ext-large'
+model_name = './model/chinese-roberta-wwm-ext'
+# model_name = 'D:/model/chinese-roberta-wwm-ext-large'
 model = None
 tokenizer = None
 try:
@@ -22,7 +25,7 @@ except Exception as e:
 
 # 智谱AI API客户端（必需，用于LLM重排序功能）
 # API密钥获取：https://open.bigmodel.cn/
-client = ZhipuAI(api_key="dab23a7b3db0459dbeb2a1e1941721a3.qbD9kfVvLcHfFrtc")  
+client = ZhipuAI(api_key="1a2a485fe1fc4bd5aa0d965bf452c8c8.se8RZdT8cH8skEDo")
 
 def generate_vector(text):
     """生成文本向量（需要模型已加载）"""
@@ -170,25 +173,137 @@ def generate_prompt_and_sort(mention, results):
             model="glm-4-flash",
             messages=[{"role": "user", "content": prompt}]
         )
-        sorted_links = response.choices[0].message.content.strip().split("\n")
-        sorted_links = ensure_links_match(sorted_links, original_links)
+        # 解析LLM返回的链接，支持多种格式
+        response_text = response.choices[0].message.content.strip()
+        # 按行分割，并清理每行
+        sorted_links_raw = [line.strip() for line in response_text.split("\n") if line.strip()]
+        # 使用ensure_links_match进行匹配和清理
+        sorted_links = ensure_links_match(sorted_links_raw, original_links)
         return sorted_links
     except Exception as e:
         print(f"LLM failed to sort links for mention '{mention}'. Error: {e}")
         return original_links  
     
+def normalize_url(url):
+    """
+    归一化URL，处理URL编码问题
+    将URL编码和解码的版本都归一化到同一个格式进行比较
+    返回解码后的标题部分（用于比较）
+    """
+    if not url:
+        return ""
+    
+    url = str(url).strip()
+    
+    # 如果是维基百科链接，提取标题部分进行归一化
+    if "wikipedia.org/wiki/" in url:
+        try:
+            # 提取wiki标题部分
+            if "/wiki/" in url:
+                parts = url.split("/wiki/", 1)
+                if len(parts) == 2:
+                    title = parts[1]
+                    
+                    # 解码URL编码（如果有）
+                    try:
+                        decoded_title = unquote(title)
+                    except:
+                        decoded_title = title
+                    
+                    # 返回解码后的标题（用于比较）
+                    # 这样无论输入是URL编码还是中文直接编码，都能正确匹配
+                    return decoded_title
+        except Exception as e:
+            # 如果处理失败，返回原始URL的标题部分
+            pass
+    
+    # 如果不是维基百科链接，返回原始URL
+    return url
+
+def clean_link(link):
+    """清理链接，移除空白字符和常见前缀"""
+    if not link:
+        return ""
+    # 移除首尾空白
+    link = str(link).strip()
+    # 移除常见的编号前缀（如 "1. ", "选项1: " 等）
+    link = re.sub(r'^\d+[\.\)]\s*', '', link)  # 移除 "1. " 或 "1) "
+    link = re.sub(r'^选项\d+[：:]\s*', '', link)  # 移除 "选项1: "
+    link = re.sub(r'^link[：:]\s*', '', link, flags=re.IGNORECASE)  # 移除 "link: "
+    return link.strip()
+
 def ensure_links_match(sorted_links, original_links):
     """
     确保排序后的链接与原始链接一致，替换不匹配的链接。
+    支持模糊匹配（子字符串匹配）。
     """
-    sorted_links_set = set(sorted_links)
+    # 清理所有链接
+    cleaned_sorted = [clean_link(link) for link in sorted_links]
     original_links_set = set(original_links)
-
-    if sorted_links_set != original_links_set:
-        sorted_links = [link for link in original_links if link in sorted_links_set]
-        sorted_links.extend([link for link in original_links if link not in sorted_links_set])
-
-    return sorted_links
+    
+    # 创建映射：清理后的链接 -> 原始链接
+    cleaned_to_original = {}
+    for orig_link in original_links:
+        cleaned = clean_link(orig_link)
+        cleaned_to_original[cleaned] = orig_link
+    
+    # 匹配和重建排序列表
+    matched_links = []
+    used_original_links = set()
+    
+    for cleaned_link in cleaned_sorted:
+        matched = False
+        # 精确匹配
+        if cleaned_link in cleaned_to_original:
+            orig_link = cleaned_to_original[cleaned_link]
+            if orig_link not in used_original_links:
+                matched_links.append(orig_link)
+                used_original_links.add(orig_link)
+                matched = True
+        
+        # 2. URL归一化匹配（处理URL编码问题）
+        if not matched:
+            normalized_link = normalize_url(cleaned_link)
+            for orig_link in original_links:
+                if orig_link not in used_original_links:
+                    orig_cleaned = clean_link(orig_link)
+                    orig_normalized = normalize_url(orig_cleaned)
+                    if normalized_link == orig_normalized:
+                        matched_links.append(orig_link)
+                        used_original_links.add(orig_link)
+                        matched = True
+                        break
+        
+        # 3. 如果精确匹配失败，尝试模糊匹配（子字符串匹配）
+        if not matched:
+            for orig_link in original_links:
+                if orig_link not in used_original_links:
+                    orig_cleaned = clean_link(orig_link)
+                    # 双向子字符串匹配
+                    if cleaned_link in orig_cleaned or orig_cleaned in cleaned_link:
+                        matched_links.append(orig_link)
+                        used_original_links.add(orig_link)
+                        matched = True
+                        break
+        
+        # 4. 归一化后的模糊匹配
+        if not matched:
+            normalized_link = normalize_url(cleaned_link)
+            for orig_link in original_links:
+                if orig_link not in used_original_links:
+                    orig_normalized = normalize_url(clean_link(orig_link))
+                    if normalized_link in orig_normalized or orig_normalized in normalized_link:
+                        matched_links.append(orig_link)
+                        used_original_links.add(orig_link)
+                        matched = True
+                        break
+    
+    # 添加未匹配的原始链接
+    for orig_link in original_links:
+        if orig_link not in used_original_links:
+            matched_links.append(orig_link)
+    
+    return matched_links
 
 def read_excel(file_path):
     df = pd.read_excel(file_path, header=None)
@@ -209,8 +324,34 @@ def calculate_metrics(queries, correct_links):
             sorted_links = generate_prompt_and_sort(query, results)
             rank = None
 
+            # 改进的链接匹配：支持双向匹配、清理后的匹配和URL归一化
+            correct_link_cleaned = clean_link(str(correct_link))
+            correct_link_normalized = normalize_url(correct_link_cleaned)
+            
             for i, link in enumerate(sorted_links):
-                if correct_link in link:
+                link_cleaned = clean_link(str(link))
+                link_normalized = normalize_url(link_cleaned)
+                
+                # 多种匹配方式：
+                # 1. 归一化后的URL匹配（处理URL编码问题）
+                if correct_link_normalized == link_normalized:
+                    rank = i + 1
+                    break
+                
+                # 2. 清理后的精确匹配
+                if correct_link_cleaned == link_cleaned:
+                    rank = i + 1
+                    break
+                
+                # 3. 双向子字符串匹配
+                if (correct_link_cleaned in link_cleaned or 
+                    link_cleaned in correct_link_cleaned):
+                    rank = i + 1
+                    break
+                
+                # 4. 归一化后的双向匹配
+                if (correct_link_normalized in link_normalized or 
+                    link_normalized in correct_link_normalized):
                     rank = i + 1
                     break
 
