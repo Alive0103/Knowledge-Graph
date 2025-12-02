@@ -8,7 +8,7 @@
 3. 批量写入数据
 4. 查询数据
 """
-from 实体链接.es_client import es
+from ..es_client import es
 import time
 import string
 import random
