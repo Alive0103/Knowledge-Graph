@@ -1,25 +1,24 @@
 import torch
 from transformers import BertTokenizer, BertModel
+from zhipuai import ZhipuAI
+import numpy as np
+import re
+from urllib.parse import unquote
+from es_client import es
+import logging
 import pandas as pd
 from tqdm import tqdm
-from zhipuai import ZhipuAI
 import concurrent.futures
-import re
-import numpy as np
-from functools import lru_cache
-from urllib.parse import quote, unquote
-from work_wyy.es_client import es
-import logging
 import json
 import os
 from datetime import datetime
 
-# 配置日志记录
+# 配置日志记录，只显示WARNING及以上级别的日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('search_evaluation.log', encoding='utf-8'),
+        logging.FileHandler('search_withllm.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -311,8 +310,8 @@ def text_search(query_text, top_k=20, text_boost=1.0):
 
 def vector_search(query_text, top_k=20, vector_boost=0.8, query_vector=None, use_label_vector=False, use_llm_definition=False):
     """
-    单独的向量检索
-    
+    单独的向量检索（同时检索所有7个向量字段）
+
     Args:
         query_text: 查询文本
         top_k: 返回结果数量
@@ -320,7 +319,7 @@ def vector_search(query_text, top_k=20, vector_boost=0.8, query_vector=None, use
         query_vector: 预计算的查询向量（可选）
         use_label_vector: 是否同时使用 label_vector 字段（默认False）
         use_llm_definition: 是否使用 LLM 生成定义后生成向量（对齐方案，默认False）
-    
+
     Returns:
         检索结果列表
     """
@@ -358,24 +357,19 @@ def vector_search(query_text, top_k=20, vector_boost=0.8, query_vector=None, use
     if query_vector is None:
         return []  # 如果没有向量，返回空结果
     
-    # 确定要搜索的向量字段
-    if use_label_vector:
-        # 方案B：同时对 descriptions_vector 和 label_vector 进行搜索
-        vector_fields = [
-            ("descriptions_zh_vector", "zh", "desc"),
-            ("descriptions_en_vector", "en", "desc"),
-            ("label_zh_vector", "zh", "label"),
-            ("label_en_vector", "en", "label")
-        ]
-    else:
-        # 默认：只搜索 descriptions_vector
-        vector_fields = [
-            ("descriptions_zh_vector", "zh", "desc"),
-            ("descriptions_en_vector", "en", "desc")
-        ]
+    # 确定要搜索的向量字段（同时检索所有向量字段）
+    vector_fields = [
+        ("descriptions_zh_vector", "zh", "desc"),
+        ("descriptions_en_vector", "en", "desc"),
+        ("high_freq_words_zh_vector", "zh", "high_freq"),
+        ("high_freq_words_en_vector", "en", "high_freq"),
+        ("label_vector", "mixed", "label"),
+        ("label_zh_vector", "zh", "label"),
+        ("label_en_vector", "en", "label")
+    ]
     
     # 同时对多个向量字段做检索，然后融合结果
-    index_names = ["data2", "data1"]
+    index_names = ["data2"]  # 只使用data2索引
     merged_hits = {}  # key: (index, _id), value: {'source': ..., 'score': ..., 'lang': 'zh'/'en', 'field_type': 'desc'/'label'}
     
     for index_name in index_names:
@@ -390,12 +384,12 @@ def vector_search(query_text, top_k=20, vector_boost=0.8, query_vector=None, use
             knn_query = {
                 "field": field_name,
                 "query_vector": query_vector,
-                "k": top_k,
-                "num_candidates": top_k * 3
+                "k": top_k * 2,  # 增加候选数量
+                "num_candidates": top_k * 5  # 增加候选数量
             }
             search_body = {
                 "knn": knn_query,
-                "size": top_k
+                "size": top_k * 2  # 增加返回数量
             }
             try:
                 resp = es.search(index=index_name, body=search_body)

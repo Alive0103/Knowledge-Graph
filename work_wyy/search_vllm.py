@@ -4,12 +4,18 @@ from zhipuai import ZhipuAI
 import numpy as np
 import re
 from urllib.parse import unquote
-from work_wyy.es_client import es
+from es_client import es
 import logging
+import pandas as pd
+from tqdm import tqdm
+import concurrent.futures
+import json
+import os
+from datetime import datetime
 
-# 配置日志记录
+# 配置日志记录，只显示WARNING及以上级别的日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('vector_search_test.log', encoding='utf-8'),
@@ -50,42 +56,153 @@ client = ZhipuAI(api_key="1a2a485fe1fc4bd5aa0d965bf452c8c8.se8RZdT8cH8skEDo")
 _vector_cache = {}
 _cache_max_size = 1000
 
+# 批量向量生成时的默认 batch 大小（仅用于评测加速）
+_batch_size_for_eval = 32
+
+def preprocess_query(query):
+    """
+    预处理查询文本
+    - 清理换行符、多余空格
+    - 统一格式
+    """
+    if not query:
+        return ""
+    
+    # 转换为字符串
+    query = str(query)
+    
+    # 替换换行符为空格
+    query = query.replace('\n', ' ').replace('\r', ' ')
+    
+    # 清理多余空格
+    query = ' '.join(query.split())
+    
+    # 清理首尾空格
+    query = query.strip()
+    
+    return query
+
+
+def _batch_generate_vectors_internal(texts, use_cache=True, batch_size=None):
+    """
+    批量生成 1024 维向量（仅用于评测加速）
+
+    - 复用当前已加载的 model / tokenizer / device
+    - 自动处理 768/1024 维模型到 1024 维
+    - 做 L2 归一化
+    """
+    if model is None or tokenizer is None:
+        return [None] * len(texts)
+
+    if batch_size is None:
+        batch_size = _batch_size_for_eval
+
+    results = [None] * len(texts)
+    to_compute_indices = []
+    to_compute_texts = []
+
+    for i, t in enumerate(texts):
+        if not t or not str(t).strip():
+            continue
+        # 预处理文本
+        t = preprocess_query(str(t))
+        if not t:
+            continue
+        if use_cache and t in _vector_cache:
+            results[i] = _vector_cache[t]
+        else:
+            to_compute_indices.append(i)
+            to_compute_texts.append(t)
+
+    if not to_compute_texts:
+        return results
+
+    target_dim = 1024
+
+    for start in range(0, len(to_compute_texts), batch_size):
+        end = start + batch_size
+        batch_texts = to_compute_texts[start:end]
+        if not batch_texts:
+            continue
+
+        inputs = tokenizer(
+            batch_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+        # [B, H]
+        vectors = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+
+        for j in range(vectors.shape[0]):
+            v = vectors[j]
+            # 处理维度为 1024
+            vec_dim = len(v)
+            if vec_dim == target_dim:
+                pass
+            elif vec_dim < target_dim:
+                v = np.pad(v, (0, target_dim - vec_dim), 'constant', constant_values=0)
+            else:
+                v = v[:target_dim]
+
+            # L2 归一化
+            norm = np.linalg.norm(v)
+            if norm > 0:
+                v = v / norm
+            v_list = v.astype(float).tolist()
+
+            global_idx = to_compute_indices[start + j]
+            results[global_idx] = v_list
+            if use_cache:
+                _vector_cache[str(texts[global_idx])] = v_list
+
+    return results
+
+
 def generate_vector(text, use_cache=True):
     """
     生成文本向量（需要模型已加载）
-    
+
     Args:
         text: 输入文本
         use_cache: 是否使用缓存（默认True）
-    
+
     Returns:
         1024维向量列表，已L2归一化
     """
+    # 预处理文本
+    text = preprocess_query(text)
+    
     if not text or model is None or tokenizer is None:
         return None
-    
+
     # 使用缓存
     if use_cache:
-        cache_key = str(text)
+        cache_key = text
         if cache_key in _vector_cache:
             return _vector_cache[cache_key]
-    
+
     # 生成向量
     inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
     vector = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-    
+
     # L2归一化
     norm = np.linalg.norm(vector)
     if norm > 0:
         vector = vector / norm
-    
+
     # 处理维度问题：ES需要1024维向量
     vector_dim = len(vector)
     target_dim = 1024
-    
+
     if vector_dim == target_dim:
         pass
     elif vector_dim < target_dim:
@@ -98,50 +215,59 @@ def generate_vector(text, use_cache=True):
         norm = np.linalg.norm(vector)
         if norm > 0:
             vector = vector / norm
-    
+
     vector_list = vector.tolist()
-    
+
     # 添加到缓存
     if use_cache:
         if len(_vector_cache) >= _cache_max_size:
             first_key = next(iter(_vector_cache))
             del _vector_cache[first_key]
         _vector_cache[cache_key] = vector_list
-    
+
     return vector_list
+
 
 def vector_search(query_text, top_k=20, query_vector=None):
     """
-    单独的向量检索
-    
+    单独的向量检索（同时检索所有7个向量字段）
+
     Args:
         query_text: 查询文本
         top_k: 返回结果数量
         query_vector: 预计算的查询向量（可选）
-    
+
     Returns:
         检索结果列表
     """
+    # 预处理查询
+    query_text = preprocess_query(query_text)
+    
     # 生成查询向量
     if query_vector is None and model is not None and tokenizer is not None:
         try:
             query_vector = generate_vector(query_text, use_cache=True)
         except Exception:
             query_vector = None
-    
+
     if query_vector is None:
         return []
-    
-    # 确定要搜索的向量字段
+
+    # 确定要搜索的向量字段（同时检索所有向量字段）
     vector_fields = [
         ("descriptions_zh_vector", "zh", "desc"),
-        ("descriptions_en_vector", "en", "desc")
+        ("descriptions_en_vector", "en", "desc"),
+        ("high_freq_words_zh_vector", "zh", "high_freq"),
+        ("high_freq_words_en_vector", "en", "high_freq"),
+        ("label_vector", "mixed", "label"),
+        ("label_zh_vector", "zh", "label"),
+        ("label_en_vector", "en", "label")
     ]
-    
+
     # 同时对多个向量字段做检索，然后融合结果
-    index_names = ["data2", "data1"]
+    index_names = ["data2"]  # 只使用data2索引
     merged_hits = {}
-    
+
     for index_name in index_names:
         try:
             if not es.indices.exists(index=index_name):
@@ -154,12 +280,12 @@ def vector_search(query_text, top_k=20, query_vector=None):
             knn_query = {
                 "field": field_name,
                 "query_vector": query_vector,
-                "k": top_k,
-                "num_candidates": top_k * 3
+                "k": top_k * 2,  # 增加候选数量
+                "num_candidates": top_k * 5  # 增加候选数量
             }
             search_body = {
                 "knn": knn_query,
-                "size": top_k
+                "size": top_k * 2  # 增加返回数量
             }
             try:
                 resp = es.search(index=index_name, body=search_body)
@@ -180,10 +306,10 @@ def vector_search(query_text, top_k=20, query_vector=None):
                         }
             except Exception:
                 continue
-                        
+
     if not merged_hits:
         return []
-    
+
     # 按得分排序，取前 top_k
     sorted_items = sorted(merged_hits.values(), key=lambda x: x["score"], reverse=True)[:top_k]
     results = []
@@ -200,11 +326,15 @@ def vector_search(query_text, top_k=20, query_vector=None):
             "_field_type": item["field_type"]
         }
         results.append(result)
-        
+
     return results
+
 
 def get_alias_and_definition(mention):
     """获取实体的别名和定义"""
+    # 预处理查询
+    mention = preprocess_query(mention)
+    
     response = client.chat.completions.create(
         model="glm-4-flash",
         messages=[
@@ -220,19 +350,20 @@ def get_alias_and_definition(mention):
         ],
     )
     response_content = response.choices[0].message.content.strip()
-    
+
     if not response_content:
         raise ValueError(f"No response content for mention '{mention}'")
-    
+
     return response_content
+
 
 def normalize_url(url):
     """归一化URL，处理URL编码问题"""
     if not url:
         return ""
-    
+
     url = str(url).strip()
-    
+
     if "wikipedia.org/wiki/" in url:
         try:
             if "/wiki/" in url:
@@ -246,8 +377,9 @@ def normalize_url(url):
                     return decoded_title
         except Exception:
             pass
-    
+
     return url
+
 
 def clean_link(link):
     """清理链接，移除空白字符和常见前缀"""
@@ -259,19 +391,20 @@ def clean_link(link):
     link = re.sub(r'^link[：:]\s*', '', link, flags=re.IGNORECASE)
     return link.strip()
 
+
 def ensure_links_match(sorted_links, original_links):
     """确保排序后的链接与原始链接一致，支持模糊匹配"""
     cleaned_sorted = [clean_link(link) for link in sorted_links]
     original_links_set = set(original_links)
-    
+
     cleaned_to_original = {}
     for orig_link in original_links:
         cleaned = clean_link(orig_link)
         cleaned_to_original[cleaned] = orig_link
-    
+
     matched_links = []
     used_original_links = set()
-    
+
     for cleaned_link in cleaned_sorted:
         matched = False
         # 精确匹配
@@ -281,7 +414,7 @@ def ensure_links_match(sorted_links, original_links):
                 matched_links.append(orig_link)
                 used_original_links.add(orig_link)
                 matched = True
-        
+
         # URL归一化匹配
         if not matched:
             normalized_link = normalize_url(cleaned_link)
@@ -294,7 +427,7 @@ def ensure_links_match(sorted_links, original_links):
                         used_original_links.add(orig_link)
                         matched = True
                         break
-        
+
         # 模糊匹配
         if not matched:
             for orig_link in original_links:
@@ -305,7 +438,7 @@ def ensure_links_match(sorted_links, original_links):
                         used_original_links.add(orig_link)
                         matched = True
                         break
-        
+
         # 归一化后的模糊匹配
         if not matched:
             normalized_link = normalize_url(cleaned_link)
@@ -317,31 +450,35 @@ def ensure_links_match(sorted_links, original_links):
                         used_original_links.add(orig_link)
                         matched = True
                         break
-    
+
     # 添加未匹配的原始链接
     for orig_link in original_links:
         if orig_link not in used_original_links:
             matched_links.append(orig_link)
-    
+
     return matched_links
+
 
 def generate_prompt_and_sort_with_description(mention, results):
     """
     使用LLM重排序，重点使用完整的描述信息进行匹配
-    
+
     Args:
         mention: 查询提及
         results: 向量检索结果列表
-    
+
     Returns:
         排序后的链接列表
     """
+    # 预处理查询
+    mention = preprocess_query(mention)
+    
     input_label = mention
     response_content = ""
-    
+
     try:
         response_content = get_alias_and_definition(mention)
-        
+
         # 安全提取字段内容
         def safe_extract(content, field_name, default=""):
             if f"{field_name}：" in content:
@@ -363,14 +500,14 @@ def generate_prompt_and_sort_with_description(mention, results):
                     value = content[start:end].strip()
                     return value if value else default
             return default
-        
+
         input_aliases_zh = safe_extract(response_content, "中文别名", "")
         input_aliases_en = safe_extract(response_content, "英文别名", "")
         input_definition = safe_extract(response_content, "定义", "")
-        
+
         if not input_aliases_zh and not input_aliases_en and not input_definition:
             raise ValueError("无法从LLM响应中提取任何有效字段")
-            
+
     except (ValueError, IndexError, Exception) as e:
         logger.warning(f"LLM解析失败 for mention '{mention}': {e}")
         return [result['link'] for result in results]
@@ -378,13 +515,13 @@ def generate_prompt_and_sort_with_description(mention, results):
     # 构建选项列表，确保包含完整的描述信息
     options = []
     original_links = []
-    
+
     for idx, result in enumerate(results, start=1):
         # 获取完整的描述信息
         descriptions_zh = result.get('descriptions_zh', '')
         if not descriptions_zh:
             descriptions_zh = "（无描述信息）"
-        
+
         # 构建选项，重点展示描述信息
         option = (
             f"选项{idx}：\n"
@@ -409,8 +546,12 @@ def generate_prompt_and_sort_with_description(mention, results):
         f"  定义：{input_definition if input_definition else '无'}\n\n"
         f"选项列表：\n"
         f"{''.join(options)}\n\n"
-        f"请根据输入信息与选项的匹配度（特别关注描述信息的匹配度），从高到低严格返回所有候选的link值，"
-        f"确保返回的link值是原始选项列表中的link值的排序，不能有缺失或重复，不要解释或附加内容。"
+        f"请根据输入信息与选项的匹配度（特别关注描述信息的匹配度），从高到低严格返回所有候选的link值。\n"
+        f"【重要要求】\n"
+        f"1. 必须返回所有{len(options)}个选项的link值，不能有缺失\n"
+        f"2. 每个link值只能出现一次，不能有重复\n"
+        f"3. 只返回link值，每行一个，不要解释或附加内容\n"
+        f"4. 确保返回的link值完全匹配选项列表中的link值"
     )
 
     try:
@@ -420,37 +561,48 @@ def generate_prompt_and_sort_with_description(mention, results):
         )
         response_text = response.choices[0].message.content.strip()
         sorted_links_raw = [line.strip() for line in response_text.split("\n") if line.strip()]
-        sorted_links = ensure_links_match(sorted_links_raw, original_links)
+        
+        # 去重：保留第一次出现的链接
+        seen = set()
+        sorted_links_dedup = []
+        for link in sorted_links_raw:
+            link_normalized = normalize_url(clean_link(link))
+            if link_normalized not in seen:
+                seen.add(link_normalized)
+                sorted_links_dedup.append(link)
+        
+        sorted_links = ensure_links_match(sorted_links_dedup, original_links)
         return sorted_links
     except Exception as e:
         logger.error(f"LLM排序失败 for mention '{mention}': {e}")
         return original_links
 
+
 def test_vector_search_only(query, top_k=10):
     """
     测试单独的向量检索（不使用LLM重排序）
-    
+
     Args:
         query: 查询文本
         top_k: 返回结果数量
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"测试向量检索（无LLM重排序）")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"查询: '{query}'")
     print(f"-" * 60)
-    
+
     try:
         results = vector_search(query, top_k=top_k)
         print(f"找到 {len(results)} 个候选实体\n")
-        
+
         for i, result in enumerate(results, 1):
             print(f"{i}. {result.get('label', 'N/A')}")
             print(f"   相似度分数: {result.get('_score', 'N/A'):.4f}")
             print(f"   链接: {result.get('link', 'N/A')}")
             print(f"   描述: {result.get('descriptions_zh', '')[:100]}...")
             print()
-        
+
         return results
     except Exception as e:
         print(f"向量检索失败: {e}")
@@ -458,36 +610,37 @@ def test_vector_search_only(query, top_k=10):
         traceback.print_exc()
         return []
 
+
 def test_vector_search_with_llm(query, top_k=10):
     """
     测试向量检索 + LLM重排序（使用完整描述信息）
-    
+
     Args:
         query: 查询文本
         top_k: 返回结果数量
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"测试向量检索 + LLM重排序（使用完整描述信息）")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"查询: '{query}'")
     print(f"-" * 60)
-    
+
     try:
         # 1. 向量检索
         print("步骤1: 执行向量检索...")
         results = vector_search(query, top_k=top_k)
         print(f"找到 {len(results)} 个候选实体\n")
-        
+
         # 显示原始向量检索结果
         print("向量检索原始结果（按相似度排序）:")
         for i, result in enumerate(results[:5], 1):
             print(f"  {i}. {result.get('label', 'N/A')} (分数: {result.get('_score', 0):.4f})")
         print()
-        
+
         # 2. LLM重排序
         print("步骤2: 使用LLM重排序（重点参考描述信息）...")
         sorted_links = generate_prompt_and_sort_with_description(query, results)
-        
+
         # 显示重排序后的结果
         print(f"\nLLM重排序后的结果:")
         for i, link in enumerate(sorted_links[:5], 1):
@@ -500,7 +653,7 @@ def test_vector_search_with_llm(query, top_k=10):
             else:
                 print(f"  {i}. {link}")
         print()
-        
+
         return sorted_links
     except Exception as e:
         print(f"向量检索+LLM重排序失败: {e}")
@@ -508,27 +661,306 @@ def test_vector_search_with_llm(query, top_k=10):
         traceback.print_exc()
         return []
 
+
+def read_excel(file_path):
+    """读取Excel测试集文件"""
+    df = pd.read_excel(file_path, header=None)
+    queries = df[0].tolist()
+    correct_links = df[1].tolist()
+    return queries, correct_links
+
+
+def calculate_metrics(queries, correct_links, search_mode="vector_only"):
+    """
+    计算评估指标
+
+    Args:
+        queries: 查询列表
+        correct_links: 正确链接列表
+        search_mode: 检索模式 ("vector_only", "vector_with_llm")
+    """
+    mrr = 0
+    hit_at_1 = 0
+    hit_at_5 = 0
+    hit_at_10 = 0
+    total_processed = 0
+
+    # 用于存储详细结果的列表
+    detailed_results = []
+
+    # 预先批量生成向量，加速 GPU 计算
+    precomputed_vectors = None
+    precomputed_map = {}
+    if model is not None and tokenizer is not None:
+        try:
+            precomputed_vectors = _batch_generate_vectors_internal(queries, use_cache=True)
+            precomputed_map = {
+                str(q): vec for q, vec in zip(queries, precomputed_vectors) if vec is not None
+            }
+            logger.info(f"[{search_mode}] 批量预生成向量完成，可用向量数: {len(precomputed_map)}")
+        except Exception as e:
+            logger.warning(f"[{search_mode}] 批量预生成向量失败，回退到单条生成: {e}")
+            precomputed_map = {}
+
+    def process_query(query, correct_link):
+        try:
+            # 根据不同模式选择不同的搜索函数
+            if search_mode == "vector_only":
+                # 纯向量检索，不使用 LLM 重排序，直接按 ES 返回顺序（按相似度分数排序）
+                pre_vec = precomputed_map.get(str(query))
+                results = vector_search(query, top_k=30, query_vector=pre_vec)  # 增加top_k到30
+                # 直接按 ES 返回的顺序（已经按相似度分数排序）
+                sorted_links = [r.get("link", "") for r in results]
+            else:  # vector_with_llm
+                # 向量检索 + LLM重排序（使用完整描述信息）
+                pre_vec = precomputed_map.get(str(query))
+                results = vector_search(query, top_k=30, query_vector=pre_vec)  # 增加top_k到30，给LLM更多候选
+                sorted_links = generate_prompt_and_sort_with_description(query, results)
+
+            rank = None
+
+            # 改进的链接匹配：支持双向匹配、清理后的匹配和URL归一化
+            correct_link_cleaned = clean_link(str(correct_link))
+            correct_link_normalized = normalize_url(correct_link_cleaned)
+
+            for i, link in enumerate(sorted_links):
+                link_cleaned = clean_link(str(link))
+                link_normalized = normalize_url(link_cleaned)
+
+                # 多种匹配方式：
+                # 1. 归一化后的URL匹配（处理URL编码问题）
+                if correct_link_normalized == link_normalized:
+                    rank = i + 1
+                    break
+
+                # 2. 清理后的精确匹配
+                if correct_link_cleaned == link_cleaned:
+                    rank = i + 1
+                    break
+
+                # 3. 双向子字符串匹配
+                if (correct_link_cleaned in link_cleaned or
+                        link_cleaned in correct_link_cleaned):
+                    rank = i + 1
+                    break
+
+                # 4. 归一化后的双向匹配
+                if (correct_link_normalized in link_normalized or
+                        link_normalized in correct_link_normalized):
+                    rank = i + 1
+                    break
+
+            # 记录详细结果
+            result_entry = {
+                "query": query,
+                "correct_link": correct_link,
+                "rank": rank,
+                "sorted_links": sorted_links[:10],  # 只记录前10个结果
+                "mrr": 1 / rank if rank is not None else 0,
+                "hit@1": 1 if rank is not None and rank <= 1 else 0,
+                "hit@5": 1 if rank is not None and rank <= 5 else 0,
+                "hit@10": 1 if rank is not None and rank <= 10 else 0
+            }
+
+            detailed_results.append(result_entry)
+
+            if rank is not None:
+                if os.getenv("DEBUG_SEARCH", "0") == "1":
+                    logger.info(f"[{search_mode}] 查询 '{query}' 的正确结果排名: {rank}")
+                return 1 / rank, 1 if rank <= 1 else 0, 1 if rank <= 5 else 0, 1 if rank <= 10 else 0
+            else:
+                if os.getenv("DEBUG_SEARCH", "0") == "1":
+                    logger.warning(f"[{search_mode}] 查询 '{query}' 未找到正确结果")
+                return 0, 0, 0, 0
+        except Exception as e:
+            logger.error(f"[{search_mode}] 处理查询 '{query}' 时出错: {e}")
+            result_entry = {
+                "query": query,
+                "correct_link": correct_link,
+                "error": str(e),
+                "mrr": 0,
+                "hit@1": 0,
+                "hit@5": 0,
+                "hit@10": 0
+            }
+            detailed_results.append(result_entry)
+            return 0, 0, 0, 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(process_query, query, correct_link) for query, correct_link in
+                   zip(queries, correct_links)]
+
+        # 使用tqdm显示进度，并实时更新指标
+        progress_bar = tqdm(concurrent.futures.as_completed(futures), total=len(queries),
+                            desc=f"Processing {search_mode} queries",
+                            ncols=100,
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+
+        for future in progress_bar:
+            result = future.result()
+            mrr += result[0]
+            hit_at_1 += result[1]
+            hit_at_5 += result[2]
+            hit_at_10 += result[3]
+            total_processed += 1
+
+            # 实时计算并更新进度条显示的指标
+            current_mrr = mrr / total_processed if total_processed > 0 else 0
+            current_hit1 = hit_at_1 / total_processed if total_processed > 0 else 0
+            current_hit5 = hit_at_5 / total_processed if total_processed > 0 else 0
+            current_hit10 = hit_at_10 / total_processed if total_processed > 0 else 0
+
+            # 更新进度条描述，显示当前指标
+            progress_bar.set_postfix({
+                'MRR': f'{current_mrr:.4f}',
+                'Hit@1': f'{current_hit1:.4f}',
+                'Hit@5': f'{current_hit5:.4f}',
+                'Hit@10': f'{current_hit10:.4f}'
+            })
+
+    if total_processed > 0:
+        mrr /= total_processed
+        hit_at_1 /= total_processed
+        hit_at_5 /= total_processed
+        hit_at_10 /= total_processed
+    else:
+        print("No queries were processed successfully.")
+        return 0, 0, 0, 0
+
+    # 生成完整报告
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "search_mode": search_mode,
+        "total_queries": len(queries),
+        "processed_queries": total_processed,
+        "metrics": {
+            "mrr": mrr,
+            "hit@1": hit_at_1,
+            "hit@5": hit_at_5,
+            "hit@10": hit_at_10
+        },
+        "detailed_results": detailed_results
+    }
+
+    # 保存报告到文件
+    with open(f'evaluation_report_{search_mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w',
+              encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[{search_mode}] 完整评估报告已保存到文件")
+
+    return mrr, hit_at_1, hit_at_5, hit_at_10
+
+
+def evaluate_all_modes(queries, correct_links):
+    """评估所有检索模式"""
+    modes = ["vector_only", "vector_with_llm"]
+    results = {}
+
+    for mode in modes:
+        print(f"\n开始评测 {mode} 检索模式...")
+        logger.info(f"开始评测 {mode} 检索模式，共 {len(queries)} 个查询")
+
+        mrr, hit_at_1, hit_at_5, hit_at_10 = calculate_metrics(queries, correct_links, mode)
+
+        results[mode] = {
+            "mrr": mrr,
+            "hit@1": hit_at_1,
+            "hit@5": hit_at_5,
+            "hit@10": hit_at_10
+        }
+
+        print(f"\n{mode} 检索模式评测结果:")
+        print("=" * 50)
+        print(f"MRR: {mrr:.4f}")
+        print(f"Hit@1: {hit_at_1:.4f}")
+        print(f"Hit@5: {hit_at_5:.4f}")
+        print(f"Hit@10: {hit_at_10:.4f}")
+
+    # 输出汇总报告
+    print(f"\n{'=' * 70}")
+    print("所有检索模式评测结果汇总:")
+    print(f"{'=' * 70}")
+    print(f"{'模式':<20} {'MRR':<10} {'Hit@1':<10} {'Hit@5':<10} {'Hit@10':<10}")
+    print("-" * 70)
+    for mode in modes:
+        metrics = results[mode]
+        mode_display = {
+            "vector_only": "向量检索(无LLM)",
+            "vector_with_llm": "向量检索+LLM(使用描述)"
+        }.get(mode, mode)
+        print(
+            f"{mode_display:<20} {metrics['mrr']:<10.4f} {metrics['hit@1']:<10.4f} {metrics['hit@5']:<10.4f} {metrics['hit@10']:<10.4f}")
+
+    # 保存汇总报告
+    summary_report = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": results
+    }
+
+    with open(f'evaluation_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w', encoding='utf-8') as f:
+        json.dump(summary_report, f, ensure_ascii=False, indent=2)
+
+    logger.info("所有检索模式评测完成，汇总报告已保存")
+
+
 def main():
-    """主函数：测试向量检索和向量+LLM重排序"""
-    print("=" * 60)
-    print("向量检索测试工具")
-    print("=" * 60)
-    print("\n测试模式：")
-    print("1. 单独的向量检索（不使用LLM）")
-    print("2. 向量检索 + LLM重排序（使用完整描述信息）")
-    print()
-    
-    # 测试查询列表
-    test_queries = ["AK47", "F-16战斗机", "步枪", "航空母舰", "狙击步枪"]
-    
-    for query in test_queries:
-        # 测试1: 单独的向量检索
-        test_vector_search_only(query, top_k=10)
-        
-        # 测试2: 向量检索 + LLM重排序
-        test_vector_search_with_llm(query, top_k=10)
-        
-        print("\n" + "="*60 + "\n")
+    """主函数：从Excel文件读取测试集并计算评估指标"""
+    import sys
+
+    file_path = "data/find.xlsx"
+
+    # 如果评测文件不存在，运行简单测试
+    if not os.path.exists(file_path):
+        print(f"未找到评测文件: {file_path}")
+        print("运行简单测试模式...\n")
+
+        # 测试查询列表
+        test_queries = ["AK47", "F-16战斗机", "步枪"]
+
+        for query in test_queries:
+            test_vector_search_only(query, top_k=10)
+            test_vector_search_with_llm(query, top_k=10)
+            print("\n" + "=" * 60 + "\n")
+        return
+
+    try:
+        queries, correct_links = read_excel(file_path)
+        print(f"读取了 {len(queries)} 个查询")
+
+        # 检查是否有指定评测模式的命令行参数
+        if len(sys.argv) > 1 and sys.argv[1] in ["--vector-only", "--vector-with-llm"]:
+            # 显式指定单一模式
+            arg = sys.argv[1]
+            if arg == "--vector-only":
+                mode = "vector_only"
+            else:
+                mode = "vector_with_llm"
+            logger.info(f"开始评测 {mode} 检索模式，共 {len(queries)} 个查询")
+            print(f"开始评测 {mode} 检索模式...")
+            mrr, hit_at_1, hit_at_5, hit_at_10 = calculate_metrics(queries, correct_links, mode)
+            print(f"\n{mode} 检索模式评测结果:")
+            print(f"{'=' * 50}")
+            print(f"MRR: {mrr:.4f}")
+            print(f"Hit@1: {hit_at_1:.4f}")
+            print(f"Hit@5: {hit_at_5:.4f}")
+            print(f"Hit@10: {hit_at_10:.4f}")
+        else:
+            # 默认或 --all：依次评测所有模式并输出汇总
+            evaluate_all_modes(queries, correct_links)
+    except Exception as e:
+        print(f"评测失败: {e}")
+        logger.error(f"评测失败: {e}")
+        print("\n运行简单测试模式...\n")
+
+        # 测试查询列表
+        test_queries = ["AK47", "F-16战斗机", "步枪"]
+
+        for query in test_queries:
+            test_vector_search_only(query, top_k=10)
+            test_vector_search_with_llm(query, top_k=10)
+            print("\n" + "=" * 60 + "\n")
+
 
 if __name__ == "__main__":
     main()
