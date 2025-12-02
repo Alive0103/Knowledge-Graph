@@ -8,7 +8,7 @@ import re
 import numpy as np
 from functools import lru_cache
 from urllib.parse import quote, unquote
-from 实体链接.es_client import es
+from work_wyy.es_client import es
 import logging
 import json
 import os
@@ -1264,7 +1264,7 @@ def main():
         test_individual_search_modes()
         return
     
-    file_path = "find.xlsx"
+    file_path = "data/find.xlsx"
     
     # 如果评测文件不存在，运行测试搜索
     if not os.path.exists(file_path):

@@ -52,14 +52,14 @@ SERVICE_ID = "ops-text-embedding-002"  # 或使用 "ops-qwen3-embedding-0.6b"
 ### 测试阿里云OpenSearch API
 
 ```bash
-cd 实体链接/testes/test_vector
+cd work_wyy/testes/test_vector
 python test_opensearch_embedding.py
 ```
 
 ### 测试本地模型
 
 ```bash
-cd 实体链接/testes/test_vector
+cd work_wyy/testes/test_vector
 python vector_test.py
 ```
 

@@ -2,12 +2,12 @@ import torch
 from transformers import BertTokenizer, BertModel
 import pandas as pd
 from tqdm import tqdm
-from 实体链接.es_client import es
+from work_wyy.es_client import es
 
 # 模型加载（可选，如果不需要向量功能可以注释掉）
 # 使用原始字符串（r"..."）或正斜杠来避免转义问题
 model_name = r'D:\work\毕设\知识图谱\Knowledge-Graph\实体链接\model\chinese-roberta-wwm-ext'
-# 或者使用正斜杠：'D:/work/毕设/知识图谱/Knowledge-Graph/实体链接/model/chinese-roberta-wwm-ext'
+# 或者使用正斜杠：'D:/work/毕设/知识图谱/Knowledge-Graph/work_wyy/model/chinese-roberta-wwm-ext'
 model = None
 tokenizer = None
 try:
@@ -153,7 +153,7 @@ def test_search():
 def main():
     import os
     
-    file_path = "find.xlsx"
+    file_path = "data/find.xlsx"
     
     # 如果评测文件不存在，运行测试搜索
     if not os.path.exists(file_path):

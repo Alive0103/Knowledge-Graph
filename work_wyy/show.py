@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request, Response
 import re
 import hashlib
-from 实体链接.es_client import es
+from work_wyy.es_client import es
 
 image_cache = {}
 

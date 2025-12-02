@@ -161,7 +161,7 @@ def improved_hybrid_search(query_text, top_k=20, text_boost=1.0, vector_boost=0.
         }
     
     # 5. 执行搜索（与原版相同的索引查找逻辑）
-    from 实体链接.es_client import es
+    from work_wyy.es_client import es
     index_names = ["data2", "data1"]
     response = None
     

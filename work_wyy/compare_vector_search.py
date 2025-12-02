@@ -122,7 +122,7 @@ def main():
     print("=" * 80)
     print()
     
-    file_path = "find.xlsx"
+    file_path = "data/find.xlsx"
     
     if not os.path.exists(file_path):
         print(f"错误: 未找到评测文件: {file_path}")
