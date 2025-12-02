@@ -59,7 +59,7 @@ try:
     print(f"\nBERT模型加载成功: {model_name}")
     print(f"使用设备: {device}")
     print(f"预期向量维度: {VECTOR_DIMS}")
-    
+
     # 测试生成一个向量，验证维度是否正确（需要先定义 generate_vector，所以放在后面）
     print("\n⚠️  注意: 向量维度测试将在首次调用 generate_vector 时进行")
     print("=" * 60)
@@ -104,7 +104,7 @@ def create_vector_index():
                     "similarity": "cosine"
                 },
                 "label_en_vector": {
-                    "type": "dense_vector", 
+                    "type": "dense_vector",
                     "dims": VECTOR_DIMS,
                     "index": True,
                     "similarity": "cosine"
@@ -112,7 +112,7 @@ def create_vector_index():
             }
         }
     }
-    
+
     # 检查索引是否存在
     if es.indices.exists(index=INDEX_NAME):
         print(f"删除现有索引: {INDEX_NAME}")
@@ -122,12 +122,12 @@ def create_vector_index():
         except Exception as e:
             print(f"删除索引失败: {e}")
             return False
-    
+
     # 创建新索引
     try:
         # 兼容新旧版本的 ES API
-    try:
-        es.indices.create(index=INDEX_NAME, body=index_mapping)
+        try:
+            es.indices.create(index=INDEX_NAME, body=index_mapping)
         except TypeError:
             # 新版本 API 使用 mappings 参数
             es.indices.create(index=INDEX_NAME, mappings=index_mapping.get("mappings", {}))
@@ -141,7 +141,7 @@ def create_vector_index():
 
 def generate_vector(text):
     """生成文本向量 - 优化性能，使用GPU加速
-    
+
     注意：这个函数在模块加载时会被调用进行测试，所以不能依赖全局变量
     """
     if text and text.strip():
@@ -153,7 +153,7 @@ def generate_vector(text):
 
             with torch.no_grad():
                 outputs = model(**inputs)
-            
+
             vector = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
 
             # 确保向量是一维数组
@@ -163,19 +163,20 @@ def generate_vector(text):
             elif len(vector.shape) > 1:
                 # 如果是多维，展平为一维
                 vector = vector.flatten()
-            
+
             # 检查向量维度
             actual_dims = len(vector)
-                
-                if actual_dims != VECTOR_DIMS:
+
+            if actual_dims != VECTOR_DIMS:
                 # 记录维度不匹配的错误（改为 WARNING 以便排查问题）
-                logger.warning(f"向量维度不匹配! 期望: {VECTOR_DIMS}, 实际: {actual_dims}, 文本: {text[:50] if text else 'None'}")
-                    return None
-                
-                # 添加L2归一化
-                norm = np.linalg.norm(vector)
-                if norm > 0:
-                    vector = vector / norm
+                logger.warning(
+                    f"向量维度不匹配! 期望: {VECTOR_DIMS}, 实际: {actual_dims}, 文本: {text[:50] if text else 'None'}")
+                return None
+
+            # 添加L2归一化
+            norm = np.linalg.norm(vector)
+            if norm > 0:
+                vector = vector / norm
             else:
                 return None
 
@@ -184,7 +185,7 @@ def generate_vector(text):
             # 验证转换后的维度
             if len(vector_list) != VECTOR_DIMS:
                 return None
-                
+
             # 确保所有元素都是 float 类型（ES dense_vector 要求）
             vector_list = [float(x) for x in vector_list]
 
@@ -212,7 +213,7 @@ def process_single_item(item):
         else:
             logger.error(f"❌ 向量生成测试失败: generate_vector 返回 None")
         process_single_item._tested = True
-    
+
     # 提取关键字段
     label = item.get("label", "")
     link = item.get("wikipedia") or item.get("wikipediaLink", "")
@@ -221,7 +222,7 @@ def process_single_item(item):
     descriptions_en = item.get("en_description") or item.get("descriptions_en", "")
     descriptions_zh = item.get("zh_description") or item.get("descriptions_zh", "")
     content = item.get("content", "")
-    
+
     # 构建数据对象
     new_data = {
         "label": label,
@@ -243,12 +244,12 @@ def process_single_item(item):
         zh_text_for_vector = label
         if aliases_zh and isinstance(aliases_zh, list):
             zh_text_for_vector += " " + " ".join(aliases_zh[:5])  # 限制别名数量
-    
+
     if zh_text_for_vector:
         vector = generate_vector(zh_text_for_vector)
         if vector:
             if len(vector) == VECTOR_DIMS:
-            new_data["descriptions_zh_vector"] = vector
+                new_data["descriptions_zh_vector"] = vector
             else:
                 logger.warning(f"中文向量维度错误: 期望{VECTOR_DIMS}, 实际{len(vector)}, 标签: {label[:30]}")
         else:
@@ -266,12 +267,12 @@ def process_single_item(item):
         en_text_for_vector = label
         if aliases_en and isinstance(aliases_en, list):
             en_text_for_vector += " " + " ".join(aliases_en[:5])  # 限制别名数量
-    
+
     if en_text_for_vector:
         vector = generate_vector(en_text_for_vector)
         if vector:
             if len(vector) == VECTOR_DIMS:
-            new_data["descriptions_en_vector"] = vector
+                new_data["descriptions_en_vector"] = vector
             else:
                 logger.warning(f"英文向量维度错误: 期望{VECTOR_DIMS}, 实际{len(vector)}, 标签: {label[:30]}")
         else:
@@ -326,10 +327,10 @@ def count_lines(filename):
 def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
     """处理JSONL文件并导入到ES - 优化性能"""
     print(f"开始处理文件: {input_path}")
-    
+
     total_lines = count_lines(input_path)
     print(f"文件总行数: {total_lines}")
-    
+
     actions = []
     total_imported = 0
     failed_count = 0
@@ -337,7 +338,7 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
     start_time = time.time()
     last_speed_time = start_time
     last_speed_count = 0
-    
+
     # 记录导入前的文档数量
     try:
         doc_count_before = es.count(index=INDEX_NAME)["count"]
@@ -348,16 +349,16 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
 
     with open(input_path, 'r', encoding='utf-8') as f:
         progress_bar = tqdm(total=total_lines, desc="处理进度", unit="条")
-        
+
         for line_num, line in enumerate(f, 1):
             try:
                 if not line.strip():
                     progress_bar.update(1)
                     continue
-                    
+
                 data = json.loads(line.strip())
                 transformed_data = process_single_item(data)
-                
+
                 # 统计向量数量（简化验证，减少性能开销）
                 if 'descriptions_zh_vector' in transformed_data:
                     vector_count += 1
@@ -377,23 +378,23 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
                 # 每处理一定数量显示一次进度
                 if line_num % 100 == 0:
                     logger.info(f"已处理 {line_num} 条数据，已导入 {total_imported} 条，生成向量 {vector_count} 个")
-                
+
                 actions.append({
                     "_index": INDEX_NAME,
                     "_source": transformed_data
                 })
-                
+
                 # 批量导入 - 使用新的API调用方式
                 if len(actions) >= batch_size:
                     try:
                         # 修正：使用新的API调用方式
                         success, failed = helpers.bulk(
-                            es.options(request_timeout=request_timeout), 
+                            es.options(request_timeout=request_timeout),
                             actions,
                             raise_on_error=False,
                             stats_only=False
                         )
-                        
+
                         if failed:
                             error_count = len(failed)
                             failed_count += error_count
@@ -406,9 +407,9 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
                         else:
                             total_imported += len(actions)
                             logger.debug(f"成功导入 {len(actions)} 条数据到ES")
-                        
+
                         actions = []
-                        
+
                         # 每500条显示一次进度（减少更新频率）
                         if total_imported % 500 == 0:
                             current_time = time.time()
@@ -418,7 +419,7 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
                             # 计算最近一段时间的速度
                             recent_elapsed = current_time - last_speed_time
                             recent_speed = (
-                                                       total_imported - last_speed_count) / recent_elapsed if recent_elapsed > 0 else 0
+                                                   total_imported - last_speed_count) / recent_elapsed if recent_elapsed > 0 else 0
                             last_speed_time = current_time
                             last_speed_count = total_imported
 
@@ -426,21 +427,21 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
                             device_info = "GPU" if torch.cuda.is_available() else "CPU"
 
                             progress_bar.set_postfix({
-                                '已导入': total_imported, 
+                                '已导入': total_imported,
                                 '向量数': vector_count,
                                 '失败': failed_count,
                                 '平均速度': f'{avg_speed:.1f}条/s',
                                 '当前速度': f'{recent_speed:.1f}条/s',
                                 '设备': device_info
                             })
-                            
+
                     except Exception as e:
                         logger.error(f"批量导入异常: {e}")
                         failed_count += len(actions)
                         actions = []
-                
+
                 progress_bar.update(1)
-                
+
             except Exception as e:
                 failed_count += 1
                 progress_bar.update(1)
@@ -451,12 +452,12 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
         if actions:
             try:
                 success, failed = helpers.bulk(
-                    es.options(request_timeout=request_timeout), 
+                    es.options(request_timeout=request_timeout),
                     actions,
                     raise_on_error=False,
                     stats_only=False
                 )
-                
+
                 if failed:
                     error_count = len(failed)
                     failed_count += error_count
@@ -466,11 +467,11 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
             except Exception as e:
                 logger.error(f"最后一批导入异常: {e}")
                 failed_count += len(actions)
-        
+
         progress_bar.close()
 
     elapsed_time = time.time() - start_time
-    
+
     print(f"\n{'=' * 60}")
     print(f"导入完成!")
     print(f"{'=' * 60}")
@@ -490,64 +491,69 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
         gpu_memory_used = torch.cuda.max_memory_allocated() / 1024 ** 3  # GB
         print(f"GPU显存使用: {gpu_memory_used:.2f} GB")
     print(f"{'=' * 60}")
-    
+
     # 获取最终统计
     try:
         doc_count_after = es.count(index=INDEX_NAME)["count"]
         actual_imported = doc_count_after - doc_count_before
         print(f"实际新增文档数: {actual_imported}")
         print(f"导入后索引中文档总数: {doc_count_after}")
-        
-        # 使用 exists 查询检查向量字段（dense_vector 字段不会出现在 _source 中）
-        print("\n使用 exists 查询检查向量字段（dense_vector 字段默认不在 _source 中）:")
-        
-        vector_fields = ["descriptions_zh_vector", "descriptions_en_vector", "label_zh_vector", "label_en_vector"]
-        field_stats = {}
-        
-        for field in vector_fields:
-            try:
-                query = {
-                    "query": {
-                        "exists": {"field": field}
-                    },
-                    "size": 0
-                }
-                result = es.search(index=INDEX_NAME, body=query)
-                count = result["hits"]["total"]["value"]
-                field_stats[field] = count
-                percentage = (count / doc_count_after * 100) if doc_count_after > 0 else 0
-                print(f"  ✓ {field}: {count} 个文档 ({percentage:.1f}%)")
-            except Exception as e:
-                print(f"  ✗ 查询 {field} 失败: {e}")
-                field_stats[field] = 0
-        
-        # 检查样本文档的标签（用于显示）
+
+        # 检查部分文档的向量情况
         sample_query = {
             "size": 10,
-            "_source": ["label"]
+            "_source": ["label", "descriptions_zh_vector", "descriptions_en_vector"]
         }
         sample_result = es.search(index=INDEX_NAME, body=sample_query)
-        print(f"\n样本文档标签（前10个）:")
+        print("\n样本文档向量情况:")
+        vec_count = 0
         for hit in sample_result['hits']['hits']:
-            label = hit['_source'].get('label', 'N/A')
-            print(f"  - {label}")
-        
-        # 总结
-        total_vectors = sum(field_stats.values())
-        expected_vectors = doc_count_after * 4  # 每个文档应该有4个向量
-        vector_coverage = (total_vectors / expected_vectors * 100) if expected_vectors > 0 else 0
-        print(f"\n向量字段统计:")
-        print(f"  总文档数: {doc_count_after}")
-        print(f"  总向量字段数: {total_vectors} (期望: {expected_vectors})")
-        print(f"  向量覆盖率: {vector_coverage:.1f}%")
-        
-        if vector_coverage >= 95:
-            print(f"  ✅ 向量导入成功！")
-        elif vector_coverage >= 50:
-            print(f"  ⚠️  向量覆盖率较低，可能部分文档缺少向量")
-        else:
-            print(f"  ❌ 向量覆盖率过低，请检查导入过程")
-        
+            source = hit['_source']
+            label = source.get('label', 'N/A')
+            has_zh_vec = 'descriptions_zh_vector' in source
+            has_en_vec = 'descriptions_en_vector' in source
+            zh_vec_len = len(source['descriptions_zh_vector']) if has_zh_vec else 0
+            en_vec_len = len(source['descriptions_en_vector']) if has_en_vec else 0
+            if has_zh_vec or has_en_vec:
+                vec_count += 1
+            print(f"  {label}: 中文向量={has_zh_vec}({zh_vec_len}), 英文向量={has_en_vec}({en_vec_len})")
+
+        print(f"\n样本文档中有向量的文档数: {vec_count}/{len(sample_result['hits']['hits'])}")
+
+        # 如果样本文档都没有向量，检查一个具体文档的原始数据
+        if vec_count == 0:
+            print("\n警告: 样本文档都没有向量，检查第一个文档的详细信息...")
+            first_doc_query = {
+                "size": 1,
+                "_source": True
+            }
+            first_result = es.search(index=INDEX_NAME, body=first_doc_query)
+            if first_result['hits']['hits']:
+                first_source = first_result['hits']['hits'][0]['_source']
+                print(f"第一个文档的所有字段: {list(first_source.keys())}")
+                if 'descriptions_zh_vector' in first_source:
+                    print(f"descriptions_zh_vector类型: {type(first_source['descriptions_zh_vector'])}")
+                    if isinstance(first_source['descriptions_zh_vector'], list):
+                        print(f"descriptions_zh_vector长度: {len(first_source['descriptions_zh_vector'])}")
+
+            # 尝试直接通过 ID 获取一个文档
+            print("\n尝试通过文档ID直接获取文档...")
+            try:
+                # 获取第一个文档的ID
+                if sample_result['hits']['hits']:
+                    doc_id = sample_result['hits']['hits'][0]['_id']
+                    direct_doc = es.get(index=INDEX_NAME, id=doc_id)
+                    direct_source = direct_doc['_source']
+                    print(f"直接获取的文档字段: {list(direct_source.keys())}")
+                    if 'descriptions_zh_vector' in direct_source:
+                        vec = direct_source['descriptions_zh_vector']
+                        print(
+                            f"descriptions_zh_vector存在，类型: {type(vec)}, 长度: {len(vec) if isinstance(vec, list) else 'N/A'}")
+                    else:
+                        print("descriptions_zh_vector字段不存在")
+            except Exception as e:
+                print(f"直接获取文档失败: {e}")
+
     except Exception as e:
         print(f"获取统计信息失败: {e}")
         logger.error(f"获取统计信息失败详情: {e}")
@@ -555,23 +561,23 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120):
 
 if __name__ == "__main__":
     import os
-    
+
     print("=" * 60)
     print("开始向量化导入流程")
     print("=" * 60)
-    
+
     # 先创建正确的索引映射
     print("创建向量索引映射...")
     if not create_vector_index():
         print("索引创建失败，退出")
         exit(1)
-    
+
     # 处理数据文件
     data_files = [
         "zh_wiki_v2.jsonl",
         "en_wiki_v3.jsonl"
     ]
-    
+
     processed_files = []
     for file_path in data_files:
         if os.path.exists(file_path):
@@ -581,13 +587,13 @@ if __name__ == "__main__":
             processed_files.append(file_path)
         else:
             print(f"警告: 数据文件 {file_path} 不存在")
-    
+
     if not processed_files:
         print("错误: 未找到任何数据文件")
         exit(1)
-    
+
     print(f"\n已完成处理以下文件:")
     for f in processed_files:
         print(f"  - {f}")
-    
+
     print("\n导入流程完成! 请检查阿里云控制台的向量存储用量")
