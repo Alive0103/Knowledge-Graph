@@ -311,6 +311,7 @@ def vector_search(query_text, top_k=20, query_vector=None, verbose=True):
             "aliases_zh": source.get("aliases_zh", []),
             "aliases_en": source.get("aliases_en", []),
             "descriptions_zh": source.get("descriptions_zh", ""),
+            "descriptions_en": source.get("descriptions_en", ""),
             "link": source.get("link", ""),
             "_score": item["score"],
             "_lang": item["lang"],
@@ -331,21 +332,35 @@ def vector_search(query_text, top_k=20, query_vector=None, verbose=True):
 
 
 def get_alias_and_definition(mention, verbose=True):
-    """获取实体的别名和定义"""
+    """获取实体的别名、定义和详细描述（中英文各一版）"""
     # 预处理查询
     mention = preprocess_query(mention)
 
     if verbose:
         print(f"\n{'=' * 60}")
-        print(f"🤖 LLM调用: 获取别名和定义")
+        print(f"🤖 LLM调用: 获取别名、定义和详细描述（中英文）")
         print(f"{'=' * 60}")
         print(f"📝 输入提及: '{mention}'")
 
     prompt = (
-        f"你现在是军事领域专家，需要参照以下例子给出提及对应的别名和定义。\n"
-        f"例子：提及：Steyr HS .50、别名：斯泰尔HS .50狙击步枪、定义：斯泰尔HS .50（Steyr HS.50）是由奥地利斯泰尔-曼利夏公司研制的一款手动枪机式反器材狙击步枪。\n\n"
+        f"你现在是军事领域专家，需要参照以下例子给出提及对应的别名、定义和详细描述（中英文各一版）。\n"
+        f"例子：\n"
+        f"提及：Steyr HS .50\n"
+        f"中文别名：斯泰尔HS .50狙击步枪\n"
+        f"英文别名：Steyr HS .50 sniper rifle\n"
+        f"中文定义：斯泰尔HS .50（Steyr HS.50）是由奥地利斯泰尔-曼利夏公司研制的一款手动枪机式反器材狙击步枪。\n"
+        f"英文定义：The Steyr HS .50 (Steyr HS.50) is a manually operated anti-materiel sniper rifle developed by Steyr Mannlicher of Austria.\n"
+        f"中文详细描述：斯泰尔HS .50是一款大口径反器材狙击步枪，采用手动枪机操作方式，发射12.7×99毫米（.50 BMG）弹药。该枪具有出色的远距离精确射击能力，主要用于反器材作战和远程狙击任务。\n"
+        f"英文详细描述：The Steyr HS .50 is a large-caliber anti-materiel sniper rifle with manual bolt action, chambered for 12.7×99mm (.50 BMG) ammunition. It features excellent long-range precision shooting capabilities and is primarily used for anti-materiel operations and long-range sniper missions.\n\n"
         f"输入提及：{mention}\n\n"
-        f"请按照标签：{mention}、中文别名：、英文别名：、定义：的格式直接返回所需内容，不要解释或附加内容。"
+        f"请按照以下格式直接返回所需内容，不要解释或附加内容：\n"
+        f"标签：{mention}\n"
+        f"中文别名：\n"
+        f"英文别名：\n"
+        f"中文定义：\n"
+        f"英文定义：\n"
+        f"中文详细描述：\n"
+        f"英文详细描述："
     )
 
     if verbose:
@@ -415,6 +430,194 @@ def clean_link(link):
     link = re.sub(r'^选项\d+[：:]\s*', '', link)
     link = re.sub(r'^link[：:]\s*', '', link, flags=re.IGNORECASE)
     return link.strip()
+
+
+def semantic_entity_match(query, description, verbose=True):
+    """
+    使用LLM进行精确的语义实体匹配
+    
+    Args:
+        query: 查询文本
+        description: 条目描述文本
+        verbose: 是否打印详细信息
+    
+    Returns:
+        bool: 是否匹配
+    """
+    prompt = f"""请判断以下描述是否属于查询实体的类别。只需回答"是"或"否"。
+
+查询实体: "{query}"
+描述文本: "{description[:500]}"
+
+判断标准:
+- 如果描述明确提到属于查询实体类别，回答"是"
+- 如果描述是关于查询实体类别的具体实例，回答"是"  
+- 如果描述与查询实体类别相关但不属于，回答"否"
+- 如果描述不相关，回答"否"
+
+答案: """
+
+    try:
+        response = client.chat.completions.create(
+            model="glm-4-flash",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=10
+        )
+        answer = response.choices[0].message.content.strip().lower()
+
+        if verbose:
+            print(f"   🤖 LLM判断: '{answer}'")
+
+        return "是" in answer or "yes" in answer or "true" in answer
+    except Exception as e:
+        if verbose:
+            print(f"   ❌ LLM匹配失败: {e}")
+        return False
+
+
+def is_entity_match(query_text, entry_description, verbose=True):
+    """
+    判断条目是否属于查询实体类别（语义匹配）
+    
+    使用多级匹配策略：
+    1. 关键词匹配：提取查询中的核心实体词，检查是否在描述中出现
+    2. 向量相似度匹配：快速近似匹配
+    3. LLM语义匹配：精确但较慢的匹配
+    
+    Args:
+        query_text: 查询文本（如"阿利·伯克Flight Ⅲ"）
+        entry_description: 条目描述文本
+        verbose: 是否打印详细信息
+    
+    Returns:
+        bool: 是否匹配
+    """
+    # 预处理文本
+    query_text = preprocess_query(query_text)
+    entry_description = preprocess_query(entry_description)
+
+    if verbose:
+        print(f"\n🔍 语义匹配检查:")
+        print(f"   查询: '{query_text}'")
+        print(f"   条目描述: '{entry_description[:200]}...'")
+
+    query_lower = query_text.lower()
+    desc_lower = entry_description.lower()
+
+    # 1. 直接关键词匹配：提取查询中的核心实体词
+    # 移除常见修饰词，提取核心实体名称
+    import re
+    
+    # 提取可能的实体关键词（中文和英文）
+    # 匹配中文字符、英文单词、数字、连字符等
+    entity_patterns = [
+        r'[\u4e00-\u9fa5]+',  # 中文字符
+        r'[A-Z][a-zA-Z\s-]+',  # 英文专有名词（首字母大写）
+        r'[A-Z]+[0-9]+',  # 型号（如P226, OH-58D）
+    ]
+    
+    extracted_terms = []
+    for pattern in entity_patterns:
+        matches = re.findall(pattern, query_text)
+        for match in matches:
+            match_clean = match.strip()
+            # 过滤太短的词（少于2个字符）和常见修饰词
+            if len(match_clean) >= 2 and match_clean.lower() not in ['级', '型', '号', '的', 'the', 'a', 'an']:
+                extracted_terms.append(match_clean)
+    
+    # 检查提取的关键词是否在描述中出现
+    for term in extracted_terms:
+        term_lower = term.lower()
+        # 如果关键词在查询和描述中都出现，且长度>=3（避免太短的词误匹配）
+        if len(term) >= 3 and term_lower in query_lower and term_lower in desc_lower:
+            if verbose:
+                print(f"   ✅ 关键词匹配: '{term}' (在查询和描述中都出现)")
+            return True
+    
+    # 2. 基于向量相似度的匹配（快速近似，优先使用）
+    if model is not None and tokenizer is not None:
+        try:
+            query_vec = generate_vector(query_text, use_cache=True, verbose=False)
+            desc_vec = generate_vector(entry_description[:500], use_cache=True, verbose=False)
+
+            if query_vec and desc_vec:
+                similarity = np.dot(query_vec, desc_vec)
+                if verbose:
+                    print(f"   📊 向量相似度: {similarity:.4f}")
+
+                if similarity > 0.75:  # 提高阈值到0.75，更严格
+                    if verbose:
+                        print(f"   ✅ 向量相似度匹配 (>{0.75})")
+                    return True
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️  向量匹配失败: {e}")
+
+    # 3. 使用LLM进行语义匹配（更精确但较慢，作为最后手段）
+    if len(entry_description) > 50:  # 只有描述足够长时才使用LLM
+        try:
+            return semantic_entity_match(query_text, entry_description, verbose)
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️  LLM语义匹配失败: {e}")
+
+    if verbose:
+        print(f"   ❌ 未匹配")
+    return False
+
+
+def check_query_hit(query_text, entry_descriptions, verbose=True):
+    """
+    检查查询是否命中条目（支持语义匹配）
+    
+    Args:
+        query_text: 查询文本
+        entry_descriptions: 条目描述列表（可以是字符串或字典列表）
+        verbose: 是否打印详细信息
+    
+    Returns:
+        bool: 是否命中
+    """
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print(f"🎯 语义命中检查: '{query_text}'")
+        print(f"{'=' * 60}")
+
+    # 统一处理条目描述
+    descriptions = []
+    if isinstance(entry_descriptions, str):
+        descriptions = [entry_descriptions]
+    elif isinstance(entry_descriptions, list):
+        if entry_descriptions and isinstance(entry_descriptions[0], dict):
+            # 从字典中提取描述文本
+            for entry in entry_descriptions:
+                desc = entry.get('descriptions_zh', '') or entry.get('descriptions_en', '') or entry.get('label', '')
+                if desc:
+                    descriptions.append(desc)
+        else:
+            descriptions = entry_descriptions
+
+    if not descriptions:
+        if verbose:
+            print("   ❌ 无有效描述可检查")
+        return False
+
+    # 检查每个描述（只检查前10个，避免太慢）
+    hit_count = 0
+    check_count = min(10, len(descriptions))
+    for i, desc in enumerate(descriptions[:check_count]):
+        if is_entity_match(query_text, desc, verbose=verbose and i < 3):  # 只详细打印前3个
+            hit_count += 1
+            if verbose:
+                print(f"   ✅ 命中条目 {i+1}")
+
+    is_hit = hit_count > 0
+
+    if verbose:
+        print(f"\n📊 命中统计: {hit_count}/{check_count} (检查前{check_count}个)")
+        print(f"🎯 最终结果: {'✅ 命中' if is_hit else '❌ 未命中'}")
+
+    return is_hit
 
 
 def ensure_links_match(sorted_links, original_links, verbose=True):
@@ -535,38 +738,51 @@ def generate_prompt_and_sort_with_description(mention, results, verbose=True):
 
         # 安全提取字段内容
         def safe_extract(content, field_name, default=""):
+            # 尝试中文冒号
             if f"{field_name}：" in content:
                 parts = content.split(f"{field_name}：", 1)
                 if len(parts) > 1:
-                    value = parts[1].split("英文别名")[0].split("定义")[0].split("\n")[0].strip()
+                    # 找到下一个字段标记作为结束位置
+                    next_markers = ["英文别名", "中文别名", "中文定义", "英文定义", "中文详细描述", "英文详细描述", "标签", "\n\n"]
+                    end_pos = len(parts[1])
+                    for marker in next_markers:
+                        marker_idx = parts[1].find(marker)
+                        if marker_idx != -1 and marker_idx < end_pos:
+                            end_pos = marker_idx
+                    value = parts[1][:end_pos].strip()
                     return value if value else default
-            elif field_name in content:
-                idx = content.find(field_name)
-                if idx != -1:
-                    start = idx + len(field_name)
-                    while start < len(content) and content[start] in [":", "：", " ", "\t"]:
-                        start += 1
-                    end = len(content)
-                    for marker in ["英文别名", "定义", "\n", "标签"]:
-                        marker_idx = content.find(marker, start)
-                        if marker_idx != -1 and marker_idx < end:
-                            end = marker_idx
-                    value = content[start:end].strip()
+            # 尝试英文冒号
+            elif f"{field_name}:" in content:
+                parts = content.split(f"{field_name}:", 1)
+                if len(parts) > 1:
+                    next_markers = ["英文别名", "中文别名", "中文定义", "英文定义", "中文详细描述", "英文详细描述", "标签", "\n\n"]
+                    end_pos = len(parts[1])
+                    for marker in next_markers:
+                        marker_idx = parts[1].find(marker)
+                        if marker_idx != -1 and marker_idx < end_pos:
+                            end_pos = marker_idx
+                    value = parts[1][:end_pos].strip()
                     return value if value else default
             return default
 
         input_aliases_zh = safe_extract(response_content, "中文别名", "")
         input_aliases_en = safe_extract(response_content, "英文别名", "")
-        input_definition = safe_extract(response_content, "定义", "")
+        input_definition_zh = safe_extract(response_content, "中文定义", "")
+        input_definition_en = safe_extract(response_content, "英文定义", "")
+        input_description_zh = safe_extract(response_content, "中文详细描述", "")
+        input_description_en = safe_extract(response_content, "英文详细描述", "")
 
         if verbose:
             print(f"\n📋 解析结果:")
             print(f"   标签: {input_label}")
             print(f"   中文别名: {input_aliases_zh if input_aliases_zh else '无'}")
             print(f"   英文别名: {input_aliases_en if input_aliases_en else '无'}")
-            print(f"   定义: {input_definition if input_definition else '无'}")
+            print(f"   中文定义: {input_definition_zh if input_definition_zh else '无'}")
+            print(f"   英文定义: {input_definition_en if input_definition_en else '无'}")
+            print(f"   中文详细描述: {input_description_zh[:100] if input_description_zh else '无'}...")
+            print(f"   英文详细描述: {input_description_en[:100] if input_description_en else '无'}...")
 
-        if not input_aliases_zh and not input_aliases_en and not input_definition:
+        if not input_aliases_zh and not input_aliases_en and not input_definition_zh and not input_definition_en and not input_description_zh and not input_description_en:
             raise ValueError("无法从LLM响应中提取任何有效字段")
 
     except (ValueError, IndexError, Exception) as e:
@@ -583,18 +799,22 @@ def generate_prompt_and_sort_with_description(mention, results, verbose=True):
         print(f"\n📝 构建选项列表...")
 
     for idx, result in enumerate(results, start=1):
-        # 获取完整的描述信息
+        # 获取完整的描述信息（中英文）
         descriptions_zh = result.get('descriptions_zh', '')
         if not descriptions_zh:
             descriptions_zh = "（无描述信息）"
+        descriptions_en = result.get('descriptions_en', '')
+        if not descriptions_en:
+            descriptions_en = "（无描述信息）"
 
-        # 构建选项，重点展示描述信息
+        # 构建选项，重点展示描述信息（中英文）
         option = (
             f"选项{idx}：\n"
             f"标签(label): {result.get('label', '')}\n"
             f"中文别名(aliases_zh): {', '.join(result.get('aliases_zh', [])) if result.get('aliases_zh') else '无'}\n"
             f"英文别名(aliases_en): {', '.join(result.get('aliases_en', [])) if result.get('aliases_en') else '无'}\n"
-            f"完整描述(descriptions_zh): {descriptions_zh}\n"
+            f"中文完整描述(descriptions_zh): {descriptions_zh}\n"
+            f"英文完整描述(descriptions_en): {descriptions_en}\n"
             f"链接(link): {result.get('link', '')}\n"
         )
         options.append(option)
@@ -603,27 +823,66 @@ def generate_prompt_and_sort_with_description(mention, results, verbose=True):
         if verbose and idx <= 3:  # 只打印前3个选项
             print(f"\n   选项{idx}:")
             print(f"      标签: {result.get('label', '')}")
-            print(f"      描述: {descriptions_zh[:100]}...")
+            print(f"      中文描述: {descriptions_zh[:100]}...")
+            print(f"      英文描述: {descriptions_en[:100]}...")
             print(f"      链接: {result.get('link', '')}")
 
-    # 构建prompt，明确强调要使用描述信息进行匹配
+    # 判断输入是类别还是实例
+    is_class_query = any(keyword in input_label.lower() for keyword in ['级', 'class', '型', '系列', 'series'])
+    if not is_class_query:
+        # 检查是否包含具体实例标识（如DDG-88, OH-58D等）
+        has_instance_id = bool(re.search(r'[A-Z]+[-_]?\d+', input_label) or 
+                              re.search(r'[A-Z]{2,3}-\d+', input_label))
+        is_class_query = not has_instance_id
+    
+    # 构建prompt，明确强调要使用描述信息进行匹配（中英文），并优先选择类别页面
+    class_instruction = ""
+    if is_class_query:
+        class_instruction = (
+            f"【关键判断】根据输入信息分析，这是一个关于**类别/级别**的查询（如'阿利·伯克级驱逐舰'、'P226手枪'等），"
+            f"而不是具体某艘舰艇或某把枪的查询。\n\n"
+            f"【排序优先级】请严格按照以下优先级排序：\n"
+            f"1. **最高优先级**：类别/级别的总页面（描述整个级别/系列的特征、历史、技术参数、发展历程等）\n"
+            f"2. **次优先级**：属于该类别的具体实例页面（如具体某艘舰艇、某把枪的页面）\n"
+            f"3. **最低优先级**：相关但不完全匹配的页面\n\n"
+            f"【识别类别页面的特征】类别页面通常包含以下特征：\n"
+            f"- 描述中使用'级'、'class'、'系列'、'series'等词汇\n"
+            f"- 描述整个级别/系列的发展历史、技术特点、生产情况\n"
+            f"- 标签(label)通常是类别名称，而不是具体舰艇/武器的名称\n"
+            f"- 描述中会提到'该级'、'该系列'、'该型'等词汇\n\n"
+        )
+    else:
+        class_instruction = (
+            f"【关键判断】根据输入信息分析，这是一个关于**具体实例**的查询（如'USS Preble (DDG-88)'等），"
+            f"应优先选择对应的具体实例页面。\n\n"
+        )
+    
     prompt = (
         f"现在你是军事领域专家，需要根据输入信息与选项列表的候选的匹配度进行从高到低排序。\n\n"
-        f"【重要提示】请重点参考每个选项的完整描述(descriptions_zh)信息进行匹配度判断，描述信息包含了实体的详细特征和定义，"
-        f"比标签和别名更能准确反映实体的本质特征。在判断匹配度时，描述信息的权重应该高于标签和别名。\n\n"
+        f"【重要提示1：描述信息优先】请重点参考每个选项的完整描述信息（包括中文描述descriptions_zh和英文描述descriptions_en）进行匹配度判断，"
+        f"描述信息包含了实体的详细特征和定义，比标签和别名更能准确反映实体的本质特征。在判断匹配度时，描述信息的权重应该高于标签和别名。\n\n"
+        f"{class_instruction}"
+        f"【重要提示2：匹配度判断】在判断匹配度时，请综合考虑：\n"
+        f"- 标签和别名是否与输入信息匹配\n"
+        f"- 描述信息是否与输入信息的定义和详细描述匹配\n"
+        f"- 如果是类别查询，描述中是否明确提到属于该类别\n\n"
         f"输入信息：\n"
         f"  标签名：{input_label}\n"
         f"  中文别名：{input_aliases_zh if input_aliases_zh else '无'}\n"
         f"  英文别名：{input_aliases_en if input_aliases_en else '无'}\n"
-        f"  定义：{input_definition if input_definition else '无'}\n\n"
+        f"  中文定义：{input_definition_zh if input_definition_zh else '无'}\n"
+        f"  英文定义：{input_definition_en if input_definition_en else '无'}\n"
+        f"  中文详细描述：{input_description_zh if input_description_zh else '无'}\n"
+        f"  英文详细描述：{input_description_en if input_description_en else '无'}\n\n"
         f"选项列表：\n"
         f"{''.join(options)}\n\n"
-        f"请根据输入信息与选项的匹配度（特别关注描述信息的匹配度），从高到低严格返回所有候选的link值。\n"
+        f"请根据输入信息与选项的匹配度（特别关注中英文描述信息的匹配度，以及类别vs实例的区分），从高到低严格返回所有候选的link值。\n"
         f"【重要要求】\n"
         f"1. 必须返回所有{len(options)}个选项的link值，不能有缺失\n"
         f"2. 每个link值只能出现一次，不能有重复\n"
         f"3. 只返回link值，每行一个，不要解释或附加内容\n"
-        f"4. 确保返回的link值完全匹配选项列表中的link值"
+        f"4. 确保返回的link值完全匹配选项列表中的link值\n"
+        f"5. 如果输入是类别/级别，优先将类别页面排在前面；如果输入是具体实例，优先将对应实例页面排在前面"
     )
 
     if verbose:
@@ -694,6 +953,7 @@ def find_rank(correct_link, sorted_links, verbose=True):
     if verbose:
         print(f"清理后: {correct_link_cleaned}")
         print(f"归一化后: {correct_link_normalized}")
+        print(f"\n开始匹配检查...")
 
     for i, link in enumerate(sorted_links):
         link_cleaned = clean_link(str(link))
@@ -735,12 +995,20 @@ def find_rank(correct_link, sorted_links, verbose=True):
                 print(f"   匹配链接: {link}")
             break
 
-        if verbose and i < 5:  # 只打印前5个尝试
-            print(f"   位置 {i + 1}: '{link[:60]}...' - 不匹配")
+        if verbose and i < 10:  # 打印前10个尝试
+            print(f"   位置 {i + 1}: '{link[:80]}...' - 不匹配")
+            print(f"      归一化后: '{link_normalized[:60]}...'")
 
     if rank is None:
         if verbose:
             print(f"\n❌ 未找到匹配")
+            print(f"   已检查 {len(sorted_links)} 个链接")
+            print(f"   正确答案归一化后: '{correct_link_normalized}'")
+            print(f"\n   排序列表中的所有链接（前20个）:")
+            for i, link in enumerate(sorted_links[:20], 1):
+                link_norm = normalize_url(clean_link(link))
+                print(f"      {i}. {link}")
+                print(f"         归一化: {link_norm}")
 
     return rank
 
@@ -908,10 +1176,25 @@ def process_single_query(query, correct_link, use_llm=True, verbose=True):
             import traceback
             traceback.print_exc()
 
-    # 4. 查找排名
+    # 4. 语义命中检查
+    semantic_hit = False
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print(f"🔍 语义命中检查")
+        print(f"{'=' * 60}")
+    
+    # 使用新的语义匹配逻辑
+    try:
+        semantic_hit = check_query_hit(query, results, verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print(f"⚠️  语义匹配检查失败: {e}")
+        semantic_hit = False
+
+    # 5. 查找排名
     rank = find_rank(correct_link, sorted_links, verbose=verbose)
 
-    # 5. 计算指标
+    # 6. 计算指标
     if rank is not None:
         mrr = 1 / rank
         hit_at_1 = 1 if rank <= 1 else 0
@@ -923,13 +1206,14 @@ def process_single_query(query, correct_link, use_llm=True, verbose=True):
         hit_at_5 = 0
         hit_at_10 = 0
 
-    # 6. 显示结果
+    # 7. 显示结果
     print(f"\n{'=' * 80}")
     print(f"📊 评估结果:")
     print(f"{'=' * 80}")
     print(f"   查询: {query}")
     print(f"   正确答案: {correct_link}")
     print(f"   排名: {rank if rank else '未找到'}")
+    print(f"   语义命中: {'✅ 是' if semantic_hit else '❌ 否'}")
     print(f"   MRR: {mrr:.4f}")
     print(f"   Hit@1: {hit_at_1}")
     print(f"   Hit@5: {hit_at_5}")
@@ -940,6 +1224,7 @@ def process_single_query(query, correct_link, use_llm=True, verbose=True):
         "query": query,
         "correct_link": correct_link,
         "rank": rank,
+        "semantic_hit": 1 if semantic_hit else 0,  # 新增字段
         "mrr": mrr,
         "hit@1": hit_at_1,
         "hit@5": hit_at_5,
@@ -1037,6 +1322,7 @@ def main():
         total_hit1 = 0
         total_hit5 = 0
         total_hit10 = 0
+        total_semantic_hit = 0
 
         for i, (query, correct_link) in enumerate(zip(queries, correct_links), 1):
             print(f"\n\n{'=' * 80}")
@@ -1053,6 +1339,7 @@ def main():
                 total_hit1 += hit1
                 total_hit5 += hit5
                 total_hit10 += hit10
+                total_semantic_hit += result.get("semantic_hit", 0)
 
         # 计算平均指标
         if len(all_results) > 0:
@@ -1060,6 +1347,7 @@ def main():
             avg_hit1 = total_hit1 / len(all_results)
             avg_hit5 = total_hit5 / len(all_results)
             avg_hit10 = total_hit10 / len(all_results)
+            avg_semantic_hit = total_semantic_hit / len(all_results)
 
             print(f"\n\n{'=' * 80}")
             print(f"📊 总体评估结果")
@@ -1069,6 +1357,7 @@ def main():
             print(f"平均 Hit@1: {avg_hit1:.4f}")
             print(f"平均 Hit@5: {avg_hit5:.4f}")
             print(f"平均 Hit@10: {avg_hit10:.4f}")
+            print(f"平均语义命中率: {avg_semantic_hit:.4f}")
             print(f"{'=' * 80}")
 
             # 保存结果
@@ -1081,7 +1370,8 @@ def main():
                     "mrr": avg_mrr,
                     "hit@1": avg_hit1,
                     "hit@5": avg_hit5,
-                    "hit@10": avg_hit10
+                    "hit@10": avg_hit10,
+                    "semantic_hit_rate": avg_semantic_hit
                 },
                 "detailed_results": all_results
             }

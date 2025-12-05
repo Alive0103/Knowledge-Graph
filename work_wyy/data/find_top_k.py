@@ -63,50 +63,115 @@ def extract_words_en(text):
     return words
 
 
-def get_high_freq_words_in_text(text, lang='zh', min_freq=2, top_n=None):
+def get_high_freq_words_in_text(text, lang='zh', min_freq=2, top_n=None, use_ner=True):
     """
-    获取文本内部的高频词
+    获取文本内部的实体词（使用NER模型）或高频词（词频统计）
 
     Args:
         text: 文本内容
         lang: 语言类型 ('zh' 或 'en')
-        min_freq: 词的最小出现频率（出现次数>=min_freq才算高频词）
-        top_n: 返回前N个高频词，None表示返回所有满足条件的词
+        min_freq: 词的最小出现频率（出现次数>=min_freq才算高频词，仅用于非NER模式）
+        top_n: 返回前N个词，None表示返回所有满足条件的词
+        use_ner: 是否使用NER模型提取实体词（True：使用NER，False：使用词频统计）
 
     Returns:
-        high_freq_words: 高频词列表，按频率降序排列
+        high_freq_words: 实体词/高频词列表，按频率降序排列
         word_freq: 词频字典
     """
     if not text or not isinstance(text, str):
         return [], {}
 
-    # 提取词
-    if lang == 'zh':
-        words = extract_words_zh(text)
-    else:
-        words = extract_words_en(text)
+    # 优先使用NER模型提取实体词
+    if use_ner:
+        try:
+            # 导入NER提取模块（需要确保路径正确）
+            import sys
+            import os
+            # 添加父目录到路径，以便导入ner_extract_entities
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(current_dir)
+            ner_dir = os.path.join(parent_dir, 'ner')
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            if ner_dir not in sys.path:
+                sys.path.insert(0, ner_dir)
+            
+            from ner.ner_extract_entities import get_entity_words_from_text
+            
+            entity_words, entity_freq = get_entity_words_from_text(
+                text, lang=lang, verbose=False
+            )
+            
+            if entity_words:
+                # 质量检查：如果提取的实体质量太差（太短、包含标点等），回退到词频统计
+                # 检查标准：
+                # 1. 至少有一个实体长度>=4（中文）或>=5（英文）
+                # 2. 实体中不应该有太多单字符或标点
+                has_valid_entity = False
+                for entity in entity_words:
+                    # 检查实体长度和质量
+                    if lang == 'zh':
+                        # 中文：至少2个字符，且不全是标点
+                        if len(entity) >= 2 and not all(c in '，。、；：！？' for c in entity):
+                            if len(entity) >= 4:  # 至少4个字符的实体才算有效
+                                has_valid_entity = True
+                                break
+                    else:
+                        # 英文：至少3个字符
+                        if len(entity) >= 3:
+                            has_valid_entity = True
+                            break
+                
+                if has_valid_entity:
+                    # 转换为格式化的输出
+                    high_freq_word_list = entity_words
+                    word_freq_dict = entity_freq
+                    
+                    # 如果指定了top_n，只返回前N个
+                    if top_n is not None and top_n > 0:
+                        high_freq_word_list = high_freq_word_list[:top_n]
+                        word_freq_dict = {k: v for k, v in word_freq_dict.items() 
+                                        if k in high_freq_word_list}
+                    
+                    return high_freq_word_list, word_freq_dict
+                else:
+                    # 实体质量太差，回退到词频统计
+                    logger.debug(f"NER提取的实体质量太差，回退到词频统计: {entity_words}")
+                    use_ner = False
+        except Exception as e:
+            logger.warning(f"NER提取失败，回退到词频统计: {e}")
+            # 如果NER失败，回退到词频统计
+            use_ner = False
 
-    if not words:
-        return [], {}
+    # 回退到词频统计方法
+    if not use_ner:
+        # 提取词
+        if lang == 'zh':
+            words = extract_words_zh(text)
+        else:
+            words = extract_words_en(text)
 
-    # 统计词频
-    word_freq = Counter(words)
+        if not words:
+            return [], {}
 
-    # 找出高频词（出现次数>=min_freq）
-    high_freq_words = [(word, freq) for word, freq in word_freq.items() if freq >= min_freq]
+        # 统计词频
+        word_freq = Counter(words)
 
-    # 按频率降序排序
-    high_freq_words.sort(key=lambda x: x[1], reverse=True)
+        # 找出高频词（出现次数>=min_freq）
+        high_freq_words = [(word, freq) for word, freq in word_freq.items() if freq >= min_freq]
 
-    # 如果指定了top_n，只返回前N个
-    if top_n is not None and top_n > 0:
-        high_freq_words = high_freq_words[:top_n]
+        # 按频率降序排序
+        high_freq_words.sort(key=lambda x: x[1], reverse=True)
 
-    # 返回词列表和词频字典
-    high_freq_word_list = [word for word, freq in high_freq_words]
-    word_freq_dict = {word: freq for word, freq in high_freq_words}
+        # 如果指定了top_n，只返回前N个
+        if top_n is not None and top_n > 0:
+            high_freq_words = high_freq_words[:top_n]
 
-    return high_freq_word_list, word_freq_dict
+        # 返回词列表和词频字典
+        high_freq_word_list = [word for word, freq in high_freq_words]
+        word_freq_dict = {word: freq for word, freq in high_freq_words}
+
+        return high_freq_word_list, word_freq_dict
 
 
 def count_lines(filename):
@@ -180,8 +245,9 @@ def process_file(file_path, min_freq_zh=2, min_freq_en=2, top_n_zh=None, top_n_e
                 # 处理英文描述
                 en_description = data.get("en_description") or data.get("descriptions_en", "")
                 if en_description and len(en_description.strip()) >= 10:
+                    # 默认使用NER，但如果NER质量差会自动回退到词频统计
                     high_freq_words_en, word_freq_en = get_high_freq_words_in_text(
-                        en_description, lang='en', min_freq=min_freq_en, top_n=top_n_en
+                        en_description, lang='en', min_freq=min_freq_en, top_n=top_n_en, use_ner=True
                     )
                     if high_freq_words_en:
                         entity_data['_high_freq_words_en'] = high_freq_words_en
@@ -297,6 +363,13 @@ def main():
         logger.info(f"\n{file_name}文件处理完成，实体总数: {len(entities)} 条")
         save_entities_to_file(entities, output_file)
         processed_files.append(output_file)
+        
+        # 保存小范围数据（前5条）用于查看
+        sample_output_file = output_file.replace('.jsonl', '_sample_5.jsonl')
+        sample_entities = entities[:5] if len(entities) >= 5 else entities
+        if sample_entities:
+            save_entities_to_file(sample_entities, sample_output_file)
+            logger.info(f"已保存小范围数据（{len(sample_entities)}条）到: {sample_output_file}")
         
         # 显示统计信息
         logger.info(f"\n[{file_name}文件统计信息]")

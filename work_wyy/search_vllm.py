@@ -13,9 +13,9 @@ import json
 import os
 from datetime import datetime
 
-# 配置日志记录，只显示WARNING及以上级别的日志
+# 配置日志记录
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('vector_search_test.log', encoding='utf-8'),
@@ -59,6 +59,7 @@ _cache_max_size = 1000
 # 批量向量生成时的默认 batch 大小（仅用于评测加速）
 _batch_size_for_eval = 32
 
+
 def preprocess_query(query):
     """
     预处理查询文本
@@ -67,19 +68,19 @@ def preprocess_query(query):
     """
     if not query:
         return ""
-    
+
     # 转换为字符串
     query = str(query)
-    
+
     # 替换换行符为空格
     query = query.replace('\n', ' ').replace('\r', ' ')
-    
+
     # 清理多余空格
     query = ' '.join(query.split())
-    
+
     # 清理首尾空格
     query = query.strip()
-    
+
     return query
 
 
@@ -177,7 +178,7 @@ def generate_vector(text, use_cache=True):
     """
     # 预处理文本
     text = preprocess_query(text)
-    
+
     if not text or model is None or tokenizer is None:
         return None
 
@@ -242,7 +243,7 @@ def vector_search(query_text, top_k=20, query_vector=None):
     """
     # 预处理查询
     query_text = preprocess_query(query_text)
-    
+
     # 生成查询向量
     if query_vector is None and model is not None and tokenizer is not None:
         try:
@@ -320,6 +321,7 @@ def vector_search(query_text, top_k=20, query_vector=None):
             "aliases_zh": source.get("aliases_zh", []),
             "aliases_en": source.get("aliases_en", []),
             "descriptions_zh": source.get("descriptions_zh", ""),
+            "descriptions_en": source.get("descriptions_en", ""),
             "link": source.get("link", ""),
             "_score": item["score"],
             "_lang": item["lang"],
@@ -331,20 +333,34 @@ def vector_search(query_text, top_k=20, query_vector=None):
 
 
 def get_alias_and_definition(mention):
-    """获取实体的别名和定义"""
+    """获取实体的别名、定义和详细描述（中英文各一版）"""
     # 预处理查询
     mention = preprocess_query(mention)
-    
+
     response = client.chat.completions.create(
         model="glm-4-flash",
         messages=[
             {
                 "role": "user",
                 "content": (
-                    f"你现在是军事领域专家，需要参照以下例子给出提及对应的别名和定义。\n"
-                    f"例子：提及：Steyr HS .50、别名：斯泰尔HS .50狙击步枪、定义：斯泰尔HS .50（Steyr HS.50）是由奥地利斯泰尔-曼利夏公司研制的一款手动枪机式反器材狙击步枪。\n\n"
+                    f"你现在是军事领域专家，需要参照以下例子给出提及对应的别名、定义和详细描述（中英文各一版）。\n"
+                    f"例子：\n"
+                    f"提及：Steyr HS .50\n"
+                    f"中文别名：斯泰尔HS .50狙击步枪\n"
+                    f"英文别名：Steyr HS .50 sniper rifle\n"
+                    f"中文定义：斯泰尔HS .50（Steyr HS.50）是由奥地利斯泰尔-曼利夏公司研制的一款手动枪机式反器材狙击步枪。\n"
+                    f"英文定义：The Steyr HS .50 (Steyr HS.50) is a manually operated anti-materiel sniper rifle developed by Steyr Mannlicher of Austria.\n"
+                    f"中文详细描述：斯泰尔HS .50是一款大口径反器材狙击步枪，采用手动枪机操作方式，发射12.7×99毫米（.50 BMG）弹药。该枪具有出色的远距离精确射击能力，主要用于反器材作战和远程狙击任务。\n"
+                    f"英文详细描述：The Steyr HS .50 is a large-caliber anti-materiel sniper rifle with manual bolt action, chambered for 12.7×99mm (.50 BMG) ammunition. It features excellent long-range precision shooting capabilities and is primarily used for anti-materiel operations and long-range sniper missions.\n\n"
                     f"输入提及：{mention}\n\n"
-                    f"请按照标签：{mention}、中文别名：、英文别名：、定义：的格式直接返回所需内容，不要解释或附加内容。"
+                    f"请按照以下格式直接返回所需内容，不要解释或附加内容：\n"
+                    f"标签：{mention}\n"
+                    f"中文别名：\n"
+                    f"英文别名：\n"
+                    f"中文定义：\n"
+                    f"英文定义：\n"
+                    f"中文详细描述：\n"
+                    f"英文详细描述："
                 )
             }
         ],
@@ -472,7 +488,7 @@ def generate_prompt_and_sort_with_description(mention, results):
     """
     # 预处理查询
     mention = preprocess_query(mention)
-    
+
     input_label = mention
     response_content = ""
 
@@ -481,72 +497,89 @@ def generate_prompt_and_sort_with_description(mention, results):
 
         # 安全提取字段内容
         def safe_extract(content, field_name, default=""):
+            # 尝试中文冒号
             if f"{field_name}：" in content:
                 parts = content.split(f"{field_name}：", 1)
                 if len(parts) > 1:
-                    value = parts[1].split("英文别名")[0].split("定义")[0].split("\n")[0].strip()
+                    # 找到下一个字段标记作为结束位置
+                    next_markers = ["英文别名", "中文别名", "中文定义", "英文定义", "中文详细描述", "英文详细描述", "标签", "\n\n"]
+                    end_pos = len(parts[1])
+                    for marker in next_markers:
+                        marker_idx = parts[1].find(marker)
+                        if marker_idx != -1 and marker_idx < end_pos:
+                            end_pos = marker_idx
+                    value = parts[1][:end_pos].strip()
                     return value if value else default
-            elif field_name in content:
-                idx = content.find(field_name)
-                if idx != -1:
-                    start = idx + len(field_name)
-                    while start < len(content) and content[start] in [":", "：", " ", "\t"]:
-                        start += 1
-                    end = len(content)
-                    for marker in ["英文别名", "定义", "\n", "标签"]:
-                        marker_idx = content.find(marker, start)
-                        if marker_idx != -1 and marker_idx < end:
-                            end = marker_idx
-                    value = content[start:end].strip()
+            # 尝试英文冒号
+            elif f"{field_name}:" in content:
+                parts = content.split(f"{field_name}:", 1)
+                if len(parts) > 1:
+                    next_markers = ["英文别名", "中文别名", "中文定义", "英文定义", "中文详细描述", "英文详细描述", "标签", "\n\n"]
+                    end_pos = len(parts[1])
+                    for marker in next_markers:
+                        marker_idx = parts[1].find(marker)
+                        if marker_idx != -1 and marker_idx < end_pos:
+                            end_pos = marker_idx
+                    value = parts[1][:end_pos].strip()
                     return value if value else default
             return default
 
         input_aliases_zh = safe_extract(response_content, "中文别名", "")
         input_aliases_en = safe_extract(response_content, "英文别名", "")
-        input_definition = safe_extract(response_content, "定义", "")
+        input_definition_zh = safe_extract(response_content, "中文定义", "")
+        input_definition_en = safe_extract(response_content, "英文定义", "")
+        input_description_zh = safe_extract(response_content, "中文详细描述", "")
+        input_description_en = safe_extract(response_content, "英文详细描述", "")
 
-        if not input_aliases_zh and not input_aliases_en and not input_definition:
+        if not input_aliases_zh and not input_aliases_en and not input_definition_zh and not input_definition_en and not input_description_zh and not input_description_en:
             raise ValueError("无法从LLM响应中提取任何有效字段")
 
     except (ValueError, IndexError, Exception) as e:
         logger.warning(f"LLM解析失败 for mention '{mention}': {e}")
         return [result['link'] for result in results]
 
-    # 构建选项列表，确保包含完整的描述信息
+    # 构建选项列表，确保包含完整的描述信息（中英文）
     options = []
     original_links = []
 
     for idx, result in enumerate(results, start=1):
-        # 获取完整的描述信息
+        # 获取完整的描述信息（中英文）
         descriptions_zh = result.get('descriptions_zh', '')
         if not descriptions_zh:
             descriptions_zh = "（无描述信息）"
+        descriptions_en = result.get('descriptions_en', '')
+        if not descriptions_en:
+            descriptions_en = "（无描述信息）"
 
-        # 构建选项，重点展示描述信息
+        # 构建选项，重点展示描述信息（中英文）
         option = (
             f"选项{idx}：\n"
             f"标签(label): {result.get('label', '')}\n"
             f"中文别名(aliases_zh): {', '.join(result.get('aliases_zh', [])) if result.get('aliases_zh') else '无'}\n"
             f"英文别名(aliases_en): {', '.join(result.get('aliases_en', [])) if result.get('aliases_en') else '无'}\n"
-            f"完整描述(descriptions_zh): {descriptions_zh}\n"
+            f"中文完整描述(descriptions_zh): {descriptions_zh}\n"
+            f"英文完整描述(descriptions_en): {descriptions_en}\n"
             f"链接(link): {result.get('link', '')}\n"
         )
         options.append(option)
         original_links.append(result.get('link', ''))
 
-    # 构建prompt，明确强调要使用描述信息进行匹配
+    # 构建prompt，明确强调要使用描述信息进行匹配（中英文）
     prompt = (
         f"现在你是军事领域专家，需要根据输入信息与选项列表的候选的匹配度进行从高到低排序。\n\n"
-        f"【重要提示】请重点参考每个选项的完整描述(descriptions_zh)信息进行匹配度判断，描述信息包含了实体的详细特征和定义，"
-        f"比标签和别名更能准确反映实体的本质特征。在判断匹配度时，描述信息的权重应该高于标签和别名。\n\n"
+        f"【重要提示】请重点参考每个选项的完整描述信息（包括中文描述descriptions_zh和英文描述descriptions_en）进行匹配度判断，"
+        f"描述信息包含了实体的详细特征和定义，比标签和别名更能准确反映实体的本质特征。在判断匹配度时，描述信息的权重应该高于标签和别名。\n\n"
         f"输入信息：\n"
         f"  标签名：{input_label}\n"
         f"  中文别名：{input_aliases_zh if input_aliases_zh else '无'}\n"
         f"  英文别名：{input_aliases_en if input_aliases_en else '无'}\n"
-        f"  定义：{input_definition if input_definition else '无'}\n\n"
+        f"  中文定义：{input_definition_zh if input_definition_zh else '无'}\n"
+        f"  英文定义：{input_definition_en if input_definition_en else '无'}\n"
+        f"  中文详细描述：{input_description_zh if input_description_zh else '无'}\n"
+        f"  英文详细描述：{input_description_en if input_description_en else '无'}\n\n"
         f"选项列表：\n"
         f"{''.join(options)}\n\n"
-        f"请根据输入信息与选项的匹配度（特别关注描述信息的匹配度），从高到低严格返回所有候选的link值。\n"
+        f"请根据输入信息与选项的匹配度（特别关注中英文描述信息的匹配度），从高到低严格返回所有候选的link值。\n"
         f"【重要要求】\n"
         f"1. 必须返回所有{len(options)}个选项的link值，不能有缺失\n"
         f"2. 每个link值只能出现一次，不能有重复\n"
@@ -561,7 +594,7 @@ def generate_prompt_and_sort_with_description(mention, results):
         )
         response_text = response.choices[0].message.content.strip()
         sorted_links_raw = [line.strip() for line in response_text.split("\n") if line.strip()]
-        
+
         # 去重：保留第一次出现的链接
         seen = set()
         sorted_links_dedup = []
@@ -570,7 +603,7 @@ def generate_prompt_and_sort_with_description(mention, results):
             if link_normalized not in seen:
                 seen.add(link_normalized)
                 sorted_links_dedup.append(link)
-        
+
         sorted_links = ensure_links_match(sorted_links_dedup, original_links)
         return sorted_links
     except Exception as e:
