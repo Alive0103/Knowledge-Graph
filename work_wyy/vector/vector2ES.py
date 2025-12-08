@@ -8,6 +8,7 @@ from elasticsearch import helpers
 from tqdm import tqdm
 import time
 import logging
+from datetime import datetime
 
 # 处理导入问题：支持直接运行和作为模块导入
 # 先添加父目录到路径，以便导入es_client
@@ -52,42 +53,43 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# 模型路径 - 根据实际模型确定维度
-model_name = './model/chinese-roberta-wwm-ext-large'  # 使用large模型
-VECTOR_DIMS = 1024  # large模型是1024维，base模型是768维
+# 使用统一的向量生成模块（支持微调后的模型）
+VECTOR_DIMS = 1024  # ES向量字段维度
 
-# 初始化 BERT 模型和分词器
+# 导入向量生成模块
 try:
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    model = BertModel.from_pretrained(model_name)
-    model.eval()
-
-    # 检查是否有GPU可用，如果有则使用GPU加速
-    has_cuda = torch.cuda.is_available()
-    if has_cuda:
-        device = torch.device('cuda')
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3  # GB
-        print(f"✅ GPU检测成功!")
-        print(f"   GPU设备: {gpu_name}")
-        print(f"   GPU显存: {gpu_memory:.1f} GB")
-        print(f"   CUDA版本: {torch.version.cuda}")
-    else:
-        device = torch.device('cpu')
-        print(f"⚠️  未检测到GPU，使用CPU模式（速度较慢）")
-        print(f"   提示: 如果有NVIDIA GPU，请安装CUDA版本的PyTorch以加速")
-
-    model = model.to(device)
-    print(f"\nBERT模型加载成功: {model_name}")
-    print(f"使用设备: {device}")
-    print(f"预期向量维度: {VECTOR_DIMS}")
-
-    # 测试生成一个向量，验证维度是否正确（需要先定义 generate_vector，所以放在后面）
-    print("\n⚠️  注意: 向量维度测试将在首次调用 generate_vector 时进行")
+    import sys
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    from vector_model import load_vector_model, generate_vector as _generate_vector_module, batch_generate_vectors
+    
+    # 加载模型（优先使用微调后的模型）
+    model, tokenizer, device = load_vector_model(use_finetuned=True)
+    print(f"\n✅ 向量生成模型加载成功（使用微调后的模型）")
+    print(f"   使用设备: {device}")
+    print(f"   预期向量维度: {VECTOR_DIMS}")
     print("=" * 60)
 except Exception as e:
-    print(f"BERT模型加载失败: {e}")
-    exit(1)
+    print(f"⚠️  统一向量模块加载失败: {e}，尝试使用基础模型")
+    try:
+        model_name = './model/chinese-roberta-wwm-ext-large'
+        tokenizer = BertTokenizer.from_pretrained(model_name)
+        model = BertModel.from_pretrained(model_name)
+        model.eval()
+        has_cuda = torch.cuda.is_available()
+        if has_cuda:
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+        model = model.to(device)
+        print(f"✅ 基础模型加载成功: {model_name}")
+        print(f"   使用设备: {device}")
+        print(f"   预期向量维度: {VECTOR_DIMS}")
+        print("=" * 60)
+    except Exception as e2:
+        print(f"❌ 模型加载失败: {e2}")
+        exit(1)
 
 # ES索引名称
 INDEX_NAME = "data2"
@@ -184,64 +186,76 @@ def create_vector_index():
 
 
 def generate_vector(text):
-    """生成文本向量 - 优化性能，使用GPU加速
+    """生成文本向量 - 使用统一的向量生成模块（支持微调后的模型）
 
     注意：这个函数在模块加载时会被调用进行测试，所以不能依赖全局变量
     """
     if text and text.strip():
         try:
-            # 不再限制文本长度，让模型自己处理
+            # 优先使用统一的向量生成模块
+            try:
+                vector_list = _generate_vector_module(text, use_finetuned=True, target_dim=VECTOR_DIMS)
+                if vector_list and len(vector_list) == VECTOR_DIMS:
+                    return [float(x) for x in vector_list]
+            except:
+                pass
+            
+            # 回退到原始方法
             inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
-            # 将输入移到GPU（如果可用）
             inputs = {k: v.to(device) for k, v in inputs.items()}
-
             with torch.no_grad():
                 outputs = model(**inputs)
-
             vector = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-
-            # 确保向量是一维数组
+            
             if len(vector.shape) == 0:
                 vector = vector.reshape(1)
             elif len(vector.shape) > 1:
-                # 如果是多维，展平为一维
                 vector = vector.flatten()
-
-            # 检查向量维度
+            
             actual_dims = len(vector)
-
             if actual_dims != VECTOR_DIMS:
-                # 记录维度不匹配的错误（改为 WARNING 以便排查问题）
-                logger.warning(
-                    f"向量维度不匹配! 期望: {VECTOR_DIMS}, 实际: {actual_dims}, 文本: {text[:50] if text else 'None'}")
+                logger.warning(f"向量维度不匹配! 期望: {VECTOR_DIMS}, 实际: {actual_dims}")
                 return None
-
-            # 添加L2归一化
+            
             norm = np.linalg.norm(vector)
             if norm > 0:
                 vector = vector / norm
             else:
                 return None
-
-            vector_list = vector.tolist()
-
-            # 验证转换后的维度
-            if len(vector_list) != VECTOR_DIMS:
-                return None
-
-            # 确保所有元素都是 float 类型（ES dense_vector 要求）
-            vector_list = [float(x) for x in vector_list]
-
-            return vector_list
-
+            
+            vector_list = [float(x) for x in vector.tolist()]
+            return vector_list if len(vector_list) == VECTOR_DIMS else None
+            
         except Exception as e:
-            # 记录错误信息（改为 WARNING 级别以便排查问题）
             logger.warning(f"向量生成失败: {e}, 文本: {text[:50] if text else 'None'}")
             return None
     return None
 
 
 def generate_vectors_batch(texts, batch_size=32):
+    """
+    批量生成向量 - 使用统一的向量生成模块（支持微调后的模型）
+    """
+    # 优先使用统一的批量向量生成模块
+    try:
+        vectors = batch_generate_vectors(
+            texts,
+            use_finetuned=True,
+            target_dim=VECTOR_DIMS,
+            batch_size=batch_size
+        )
+        # 转换为float类型并验证维度
+        result = []
+        for vec in vectors:
+            if vec and len(vec) == VECTOR_DIMS:
+                result.append([float(x) for x in vec])
+            else:
+                result.append(None)
+        return result
+    except:
+        pass
+    
+    # 回退到原始方法
     """批量生成向量 - 显著提升速度（GPU模式下可提升3-10倍）
     
     Args:
@@ -351,9 +365,18 @@ def process_single_item(item, use_batch=False, vector_cache=None):
     descriptions_zh = item.get("zh_description") or item.get("descriptions_zh", "")
     content = item.get("content", "")
     
-    # 提取高频词（从预处理脚本生成的字段中读取）
-    high_freq_words_zh = item.get("_high_freq_words_zh", [])
-    high_freq_words_en = item.get("_high_freq_words_en", [])
+    # 提取实体词（优先使用新的实体词字段，兼容旧的高频词字段）
+    # 注意：现在使用NER模型提取的实体词，而不是高频词统计
+    entity_words_zh = item.get("_entity_words_zh", item.get("_high_freq_words_zh", []))
+    entity_words_en = item.get("_entity_words_en", item.get("_high_freq_words_en", []))
+    
+    # 兼容旧字段名（用于ES字段名）
+    high_freq_words_zh = entity_words_zh
+    high_freq_words_en = entity_words_en
+    
+    # 优先使用 find_top_k.py 预生成的实体词向量（如果存在）
+    entity_words_zh_vector = item.get("_entity_words_zh_vector")
+    entity_words_en_vector = item.get("_entity_words_en_vector")
 
     # 构建数据对象
     new_data = {
@@ -421,25 +444,100 @@ def process_single_item(item, use_batch=False, vector_cache=None):
         else:
             logger.warning(f"英文描述向量生成失败，标签: {label[:30]}")
     
-    # 4. 为中文高频词生成向量（所有高频词都向量化）
-    if high_freq_words_zh and isinstance(high_freq_words_zh, list) and len(high_freq_words_zh) > 0:
-        # 将所有高频词用空格连接，然后向量化
-        zh_freq_text = " ".join(high_freq_words_zh)
-        zh_freq_vector = generate_vector(zh_freq_text)
-        if zh_freq_vector and len(zh_freq_vector) == VECTOR_DIMS:
-            new_data["high_freq_words_zh_vector"] = zh_freq_vector
-        else:
-            logger.warning(f"中文高频词向量生成失败，标签: {label[:30]}, 高频词数: {len(high_freq_words_zh)}")
+    # 4. 为中文实体词生成向量（使用NER提取的实体词，而不是高频词）
+    # 优先使用 find_top_k.py 预生成的向量（如果存在）
+    if entity_words_zh_vector and isinstance(entity_words_zh_vector, list) and len(entity_words_zh_vector) == VECTOR_DIMS:
+        # 直接使用预生成的向量（已使用微调后的模型向量化并合并）
+        new_data["high_freq_words_zh_vector"] = [float(x) for x in entity_words_zh_vector]
+        logger.debug(f"使用预生成的中文实体词向量，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh) if high_freq_words_zh else 0}")
+    elif high_freq_words_zh and isinstance(high_freq_words_zh, list) and len(high_freq_words_zh) > 0:
+        # 如果没有预生成的向量，则重新向量化（使用微调后的模型）
+        # 方法：对每个实体词单独向量化，然后合并（与 find_top_k.py 保持一致）
+        try:
+            from vector_model import batch_generate_vectors
+            import numpy as np
+            
+            # 批量生成每个实体词的向量（使用微调后的模型）
+            entity_vectors = batch_generate_vectors(
+                high_freq_words_zh,
+                use_finetuned=True,
+                target_dim=VECTOR_DIMS,
+                batch_size=32
+            )
+            
+            # 过滤掉None值
+            valid_vectors = [v for v in entity_vectors if v is not None and isinstance(v, list) and len(v) == VECTOR_DIMS]
+            
+            if valid_vectors:
+                # 合并向量（使用平均值，与 find_top_k.py 保持一致）
+                vectors_array = np.array(valid_vectors)
+                merged_vector = np.mean(vectors_array, axis=0)
+                
+                # L2归一化
+                norm = np.linalg.norm(merged_vector)
+                if norm > 0:
+                    merged_vector = merged_vector / norm
+                    new_data["high_freq_words_zh_vector"] = [float(x) for x in merged_vector.tolist()]
+                else:
+                    logger.warning(f"中文实体词向量合并后归一化失败，标签: {label[:30]}")
+            else:
+                logger.warning(f"中文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh)}")
+        except Exception as e:
+            # 回退到原始方法（将所有实体词用空格连接，然后向量化）
+            logger.warning(f"批量向量化失败，使用回退方法: {e}")
+            zh_freq_text = " ".join(high_freq_words_zh)
+            zh_freq_vector = generate_vector(zh_freq_text)
+            if zh_freq_vector and len(zh_freq_vector) == VECTOR_DIMS:
+                new_data["high_freq_words_zh_vector"] = zh_freq_vector
+            else:
+                logger.warning(f"中文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh)}")
     
-    # 5. 为英文高频词生成向量（所有高频词都向量化）
-    if high_freq_words_en and isinstance(high_freq_words_en, list) and len(high_freq_words_en) > 0:
-        # 将所有高频词用空格连接，然后向量化
-        en_freq_text = " ".join(high_freq_words_en)
-        en_freq_vector = generate_vector(en_freq_text)
-        if en_freq_vector and len(en_freq_vector) == VECTOR_DIMS:
-            new_data["high_freq_words_en_vector"] = en_freq_vector
-        else:
-            logger.warning(f"英文高频词向量生成失败，标签: {label[:30]}, 高频词数: {len(high_freq_words_en)}")
+    # 5. 为英文实体词生成向量（使用NER提取的实体词，而不是高频词）
+    # 优先使用 find_top_k.py 预生成的向量（如果存在）
+    if entity_words_en_vector and isinstance(entity_words_en_vector, list) and len(entity_words_en_vector) == VECTOR_DIMS:
+        # 直接使用预生成的向量（已使用微调后的模型向量化并合并）
+        new_data["high_freq_words_en_vector"] = [float(x) for x in entity_words_en_vector]
+        logger.debug(f"使用预生成的英文实体词向量，标签: {label[:30]}, 实体词数: {len(high_freq_words_en) if high_freq_words_en else 0}")
+    elif high_freq_words_en and isinstance(high_freq_words_en, list) and len(high_freq_words_en) > 0:
+        # 如果没有预生成的向量，则重新向量化（使用微调后的模型）
+        try:
+            from vector_model import batch_generate_vectors
+            import numpy as np
+            
+            # 批量生成每个实体词的向量（使用微调后的模型）
+            entity_vectors = batch_generate_vectors(
+                high_freq_words_en,
+                use_finetuned=True,
+                target_dim=VECTOR_DIMS,
+                batch_size=32
+            )
+            
+            # 过滤掉None值
+            valid_vectors = [v for v in entity_vectors if v is not None and isinstance(v, list) and len(v) == VECTOR_DIMS]
+            
+            if valid_vectors:
+                # 合并向量（使用平均值，与 find_top_k.py 保持一致）
+                vectors_array = np.array(valid_vectors)
+                merged_vector = np.mean(vectors_array, axis=0)
+                
+                # L2归一化
+                norm = np.linalg.norm(merged_vector)
+                if norm > 0:
+                    merged_vector = merged_vector / norm
+                    new_data["high_freq_words_en_vector"] = [float(x) for x in merged_vector.tolist()]
+                else:
+                    logger.warning(f"英文实体词向量合并后归一化失败，标签: {label[:30]}")
+            else:
+                logger.warning(f"英文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_en)}")
+        except Exception as e:
+            # 回退到原始方法（将所有实体词用空格连接，然后向量化）
+            logger.warning(f"批量向量化失败，使用回退方法: {e}")
+            en_freq_text = " ".join(high_freq_words_en)
+            en_freq_vector = generate_vector(en_freq_text)
+            if en_freq_vector and len(en_freq_vector) == VECTOR_DIMS:
+                new_data["high_freq_words_en_vector"] = en_freq_vector
+            else:
+                logger.warning(f"英文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_en)}")
 
     return new_data
 
@@ -912,41 +1010,52 @@ if __name__ == "__main__":
             print(f"❌ 错误: 文件不存在: {target_file}")
             exit(1)
     
-    # 默认处理top_k_zh.jsonl和top_k_en.jsonl（预处理后的高频实体文件）
+    # 默认处理entity_words_zh.jsonl和entity_words_en.jsonl（预处理后的实体词文件）
     else:
-        # 查找预处理后的高频实体文件
+        # 查找预处理后的实体词文件（由 find_top_k.py 生成）
         target_files = [
-            "top_k_zh.jsonl",  # 中文文件处理结果
-            "top_k_en.jsonl"   # 英文文件处理结果
+            "entity_words_zh.jsonl",  # 中文文件处理结果（NER提取的实体词）
+            "entity_words_en.jsonl"   # 英文文件处理结果（NER提取的实体词）
         ]
         
         found_files = []
         for target_file in target_files:
-            # 如果当前目录没有，尝试在父目录查找
-            if not os.path.exists(target_file):
-                parent_target = os.path.join(parent_dir, target_file)
-                if os.path.exists(parent_target):
-                    target_file = parent_target
-            
+            # 按优先级查找文件：当前目录 -> data目录 -> 父目录
             if os.path.exists(target_file):
                 found_files.append(target_file)
+                continue
+            
+            # 尝试在 data 目录查找（find_top_k.py 的输出目录）
+            data_dir = os.path.join(parent_dir, 'data')
+            data_target = os.path.join(data_dir, target_file)
+            if os.path.exists(data_target):
+                found_files.append(data_target)
+                continue
+            
+            # 尝试在父目录查找
+            parent_target = os.path.join(parent_dir, target_file)
+            if os.path.exists(parent_target):
+                found_files.append(parent_target)
         
         if found_files:
             for target_file in found_files:
                 file_name = os.path.basename(target_file)
                 file_type = "中文" if "zh" in file_name else "英文"
-                print(f"\n找到预处理后的{file_type}高频实体文件: {target_file}")
+                print(f"\n找到预处理后的{file_type}实体词文件: {target_file}")
                 print(f"开始处理: {target_file}")
                 process_and_import_to_es(target_file, batch_size=20, request_timeout=180,
                                         vector_batch_size=vector_batch, use_batch_vectors=True)
                 processed_files.append(target_file)
         else:
-            print("❌ 错误: 未找到预处理后的高频实体文件")
+            print("❌ 错误: 未找到预处理后的实体词文件")
             print("   期望的文件:")
-            print("     - top_k_zh.jsonl (中文文件处理结果)")
-            print("     - top_k_en.jsonl (英文文件处理结果)")
+            print("     - entity_words_zh.jsonl (中文文件处理结果，包含NER提取的实体词)")
+            print("     - entity_words_en.jsonl (英文文件处理结果，包含NER提取的实体词)")
             print("\n   请先运行以下命令生成预处理文件:")
+            print("   cd data")
             print("   python find_top_k.py")
+            print("\n   或者:")
+            print("   python data/find_top_k.py")
             exit(1)
 
     if not processed_files:

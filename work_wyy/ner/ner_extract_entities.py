@@ -31,7 +31,7 @@ else:
 
 MAX_LENGTH = 512
 
-# 标签映射
+# 默认标签映射（如果无法加载label_mapping.json则使用）
 LABEL_TO_ID = {'O': 0, 'B-ENTITY': 1, 'I-ENTITY': 2}
 ID_TO_LABEL = {0: 'O', 1: 'B-ENTITY', 2: 'I-ENTITY'}
 
@@ -41,6 +41,30 @@ ner_tokenizer = None
 ner_device = None
 
 
+def load_label_mapping(model_path):
+    """从label_mapping.json加载标签映射"""
+    global LABEL_TO_ID, ID_TO_LABEL
+    
+    label_mapping_file = os.path.join(model_path, 'label_mapping.json')
+    if os.path.exists(label_mapping_file):
+        try:
+            import json
+            with open(label_mapping_file, 'r', encoding='utf-8') as f:
+                label_info = json.load(f)
+                LABEL_TO_ID = label_info.get('label_to_id', LABEL_TO_ID)
+                # 确保ID_TO_LABEL是整数键
+                id_to_label_raw = label_info.get('id_to_label', {})
+                ID_TO_LABEL = {int(k): v for k, v in id_to_label_raw.items()}
+                logger.info(f"✅ 成功加载标签映射: {len(LABEL_TO_ID)} 个标签")
+                return True
+        except Exception as e:
+            logger.warning(f"加载标签映射失败: {e}，使用默认映射")
+            return False
+    else:
+        logger.warning(f"标签映射文件不存在: {label_mapping_file}，使用默认映射")
+        return False
+
+
 def load_ner_model(model_path=None):
     """
     加载NER模型
@@ -48,7 +72,7 @@ def load_ner_model(model_path=None):
     Args:
         model_path: 模型路径，如果为None则使用默认路径
     """
-    global ner_model, ner_tokenizer, ner_device
+    global ner_model, ner_tokenizer, ner_device, LABEL_TO_ID, ID_TO_LABEL
     
     if model_path is None:
         model_path = NER_MODEL_PATH
@@ -69,8 +93,10 @@ def load_ner_model(model_path=None):
         logger.info(f"   模型路径验证: ✅ 存在")
         ner_tokenizer = BertTokenizer.from_pretrained(model_path)
         
-        # 如果是指定的微调模型路径，尝试加载微调后的模型
+        # 如果是指定的微调模型路径，尝试加载微调后的模型和标签映射
         if model_path == NER_MODEL_PATH and os.path.exists(model_path):
+            # 先加载标签映射
+            load_label_mapping(model_path)
             try:
                 ner_model = BertForTokenClassification.from_pretrained(model_path)
                 logger.info("✅ 成功加载微调后的NER模型")
@@ -180,9 +206,10 @@ def extract_entities_from_text(text, model_path=None, verbose=False):
         predictions_list = predictions[0].cpu().tolist()
         tokens = ner_tokenizer.convert_ids_to_tokens(input_ids_list)
         
-        # 提取实体（基于token文本拼接）
+        # 提取实体（支持多种实体类型）
         entities = []
         current_entity_tokens = []
+        current_entity_type = None
         
         for i, (token, pred_id) in enumerate(zip(tokens, predictions_list)):
             label = ID_TO_LABEL.get(pred_id, 'O')
@@ -195,12 +222,14 @@ def extract_entities_from_text(text, model_path=None, verbose=False):
                     if entity_text and len(entity_text) >= 2:
                         entities.append(entity_text)
                     current_entity_tokens = []
+                    current_entity_type = None
                 continue
             
             # 处理token（移除##前缀，这是BERT tokenizer的子词标记）
             clean_token = token.replace('##', '')
             
-            if label == 'B-ENTITY':
+            # 检查是否是B-标签（任何实体类型的开始）
+            if label.startswith('B-'):
                 # 保存之前的实体
                 if current_entity_tokens:
                     entity_text = _tokens_to_text(current_entity_tokens)
@@ -208,16 +237,28 @@ def extract_entities_from_text(text, model_path=None, verbose=False):
                         entities.append(entity_text)
                 # 开始新实体
                 current_entity_tokens = [clean_token]
-            elif label == 'I-ENTITY' and current_entity_tokens:
-                # 继续当前实体
-                current_entity_tokens.append(clean_token)
+                current_entity_type = label[2:]  # 提取实体类型
+            elif label.startswith('I-') and current_entity_tokens:
+                # 继续当前实体（检查类型是否匹配）
+                entity_type = label[2:]
+                if entity_type == current_entity_type:
+                    current_entity_tokens.append(clean_token)
+                else:
+                    # 类型不匹配，结束当前实体
+                    if current_entity_tokens:
+                        entity_text = _tokens_to_text(current_entity_tokens)
+                        if entity_text and len(entity_text) >= 2:
+                            entities.append(entity_text)
+                        current_entity_tokens = []
+                        current_entity_type = None
             else:
-                # 实体结束
+                # O标签，结束当前实体
                 if current_entity_tokens:
                     entity_text = _tokens_to_text(current_entity_tokens)
                     if entity_text and len(entity_text) >= 2:
                         entities.append(entity_text)
                     current_entity_tokens = []
+                    current_entity_type = None
         
         # 处理最后一个实体
         if current_entity_tokens:

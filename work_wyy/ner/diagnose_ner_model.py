@@ -21,17 +21,51 @@ NER_MODEL_PATH = './../model/ner_finetuned'
 BASE_MODEL_PATH = './../model/chinese-roberta-wwm-ext-large'
 
 MAX_LENGTH = 512
+
+# 默认标签映射（如果无法加载label_mapping.json则使用）
 LABEL_TO_ID = {'O': 0, 'B-ENTITY': 1, 'I-ENTITY': 2}
 ID_TO_LABEL = {0: 'O', 1: 'B-ENTITY', 2: 'I-ENTITY'}
 
 
+def load_label_mapping(model_path):
+    """从label_mapping.json加载标签映射"""
+    global LABEL_TO_ID, ID_TO_LABEL
+    
+    label_mapping_file = os.path.join(model_path, 'label_mapping.json')
+    if os.path.exists(label_mapping_file):
+        try:
+            with open(label_mapping_file, 'r', encoding='utf-8') as f:
+                label_info = json.load(f)
+                LABEL_TO_ID = label_info.get('label_to_id', LABEL_TO_ID)
+                # 确保ID_TO_LABEL的键是整数（JSON中的键可能是字符串）
+                id_to_label_raw = label_info.get('id_to_label', {})
+                ID_TO_LABEL = {int(k): v for k, v in id_to_label_raw.items()}
+                logger.info(f"成功加载标签映射: {len(LABEL_TO_ID)} 个标签")
+                logger.debug(f"标签映射示例: {dict(list(ID_TO_LABEL.items())[:5])}")
+                return True
+        except Exception as e:
+            logger.warning(f"加载标签映射失败: {e}，使用默认映射")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+    else:
+        logger.warning(f"标签映射文件不存在: {label_mapping_file}，使用默认映射")
+        return False
+
+
 def load_model():
     """加载模型"""
+    global LABEL_TO_ID, ID_TO_LABEL
+    
     if not os.path.exists(NER_MODEL_PATH):
         logger.error(f"微调模型不存在: {NER_MODEL_PATH}")
-        return None, None
+        return None, None, None
     
     logger.info(f"加载模型: {NER_MODEL_PATH}")
+    
+    # 先加载标签映射
+    load_label_mapping(NER_MODEL_PATH)
+    
     tokenizer = BertTokenizer.from_pretrained(NER_MODEL_PATH)
     model = BertForTokenClassification.from_pretrained(NER_MODEL_PATH)
     
@@ -127,17 +161,21 @@ def test_prediction_detailed(text, model, tokenizer, device):
             break
         label = ID_TO_LABEL.get(pred_id, 'O')
         probs = probabilities[0][i].cpu().tolist()
-        prob_o = probs[0]
-        prob_b = probs[1]
-        prob_i = probs[2]
+        # 计算所有B-和I-标签的概率
+        prob_o = probs[0] if 0 < len(probs) else 0.0
+        prob_b = sum([probs[j] for j in range(1, len(probs)) if j % 2 == 1]) if len(probs) > 1 else 0.0
+        prob_i = sum([probs[j] for j in range(2, len(probs)) if j % 2 == 0]) if len(probs) > 2 else 0.0
         
         logger.info(f"{token:<30} {label:<15} {prob_o:<10.4f} {prob_b:<10.4f} {prob_i:<10.4f}")
     
-    # 提取实体
+    # 提取实体（支持多种实体类型）
     entities = []
     current_entity_tokens = []
+    current_entity_type = None
     
     for i, (token, pred_id) in enumerate(zip(tokens, predictions_list)):
+        # 确保pred_id是整数
+        pred_id = int(pred_id)
         label = ID_TO_LABEL.get(pred_id, 'O')
         
         if token in ['[CLS]', '[SEP]', '[PAD]']:
@@ -146,24 +184,42 @@ def test_prediction_detailed(text, model, tokenizer, device):
                 if entity_text and len(entity_text) >= 2:
                     entities.append(entity_text)
                 current_entity_tokens = []
+                current_entity_type = None
             continue
         
         clean_token = token.replace('##', '')
         
-        if label == 'B-ENTITY':
+        # 检查是否是B-标签（任何实体类型的开始）
+        if label.startswith('B-'):
+            # 保存之前的实体
             if current_entity_tokens:
                 entity_text = ''.join(current_entity_tokens).replace('##', '')
                 if entity_text and len(entity_text) >= 2:
                     entities.append(entity_text)
+            # 开始新实体
             current_entity_tokens = [clean_token]
-        elif label == 'I-ENTITY' and current_entity_tokens:
-            current_entity_tokens.append(clean_token)
+            current_entity_type = label[2:]  # 提取实体类型
+        elif label.startswith('I-') and current_entity_tokens:
+            # 继续当前实体（检查类型是否匹配）
+            entity_type = label[2:]
+            if entity_type == current_entity_type:
+                current_entity_tokens.append(clean_token)
+            else:
+                # 类型不匹配，结束当前实体
+                if current_entity_tokens:
+                    entity_text = ''.join(current_entity_tokens).replace('##', '')
+                    if entity_text and len(entity_text) >= 2:
+                        entities.append(entity_text)
+                    current_entity_tokens = []
+                    current_entity_type = None
         else:
+            # O标签，结束当前实体
             if current_entity_tokens:
                 entity_text = ''.join(current_entity_tokens).replace('##', '')
                 if entity_text and len(entity_text) >= 2:
                     entities.append(entity_text)
                 current_entity_tokens = []
+                current_entity_type = None
     
     if current_entity_tokens:
         entity_text = ''.join(current_entity_tokens).replace('##', '')

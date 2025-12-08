@@ -1,8 +1,24 @@
 # NER实体识别模块
 
+## 📚 文档导航
+
+- **[训练与使用文档.md](./训练与使用文档.md)** - **完整训练与使用指南**（推荐阅读）
+  - 训练数据详细说明
+  - 训练效果评估（F1-Score: 98.26%）
+  - 与向量检索系统集成方案
+  - 后续优化建议
+
+## 🔄 重要更新（2025-12-08）
+
+- **向量生成已更新**: 所有向量生成代码（`search_vllm.py`、`vector2ES.py`）现在**优先使用微调后的NER模型**进行向量生成
+- **统一向量生成模块**: 新增 `vector_model.py` 模块，统一管理向量生成，支持从微调后的NER模型中提取encoder
+- **自动化流水线**: 新增 `auto_pipeline.py` 脚本，自动化执行：训练 → 测试 → 向量化 → 存入ES → 正式测试
+
 ## 概述
 
 本模块实现了基于BERT的命名实体识别（NER）功能，用于从文本中提取军事领域相关的实体词（如"宙斯盾作战系统"、"AN/SPY-13D相控阵雷达"、"阿利·伯克级驱逐舰"等）。该模块使用Chinese-RoBERTa作为基础模型，支持在军事领域NER数据上进行微调以提升识别效果。
+
+**训练效果**: F1-Score **98.26%**，支持**27种实体类型**，训练数据**3,399条**。
 
 ## 文件说明
 
@@ -20,12 +36,17 @@
 2. **`finetune_ner_model.py`** - NER模型微调脚本
    - **作用**: 在军事领域NER数据上微调Chinese-RoBERTa模型
    - **功能**:
-     - 加载NER训练数据（JSONL格式，包含实体位置标注）
+     - 支持多种数据格式（JSON数组、BIO格式、CCKS格式）
+     - 自动从多个数据目录加载数据（traindata、ccks_ner、nlp_datasets）
      - 将字符级标签对齐到token级标签（处理BERT子词切分问题）
+     - 动态构建标签映射（支持多种实体类型）
      - 使用HuggingFace Trainer进行模型训练
      - 支持训练/验证/测试集划分
-     - 自动保存最佳模型
-   - **训练数据路径**: `./../data/nerdata/train.txt`（相对于脚本所在目录）
+     - 自动保存最佳模型和标签映射信息
+   - **数据目录**: `./../data/`（相对于脚本所在目录）
+     - `traindata/`: JSON数组格式的训练数据
+     - `ccks_ner/militray/`: CCKS军事领域NER数据
+     - `nlp_datasets/ner/msra/`: MSRA BIO格式数据
    - **输出路径**: `./../model/ner_finetuned`（相对于脚本所在目录）
    - **训练参数**:
      - 最大序列长度: 512
@@ -42,12 +63,26 @@
      - 测试模型预测结果（显示每个token的预测标签和概率）
      - 提供改进建议
 
-4. **`verify_label_alignment.py`** - 标签对齐验证脚本
-   - **作用**: 验证字符级标签到token级标签的映射是否正确
+4. **`check_prerequisites.py`** - 前置条件检查脚本
+   - **作用**: 在训练前检查所有必要的条件和数据
    - **功能**:
-     - 检查训练数据中的实体位置是否正确映射到token标签
-     - 统计标签对齐的准确率
-     - 显示错误对齐的示例
+     - 检查基础模型是否存在且完整
+     - 检查训练数据是否存在且格式正确
+     - 检查CCKS数据是否可访问
+     - 检查Python依赖是否已安装
+     - 检查CUDA是否可用
+     - 统计数据信息（样本数、实体类型等）
+   - **使用**: 在运行微调脚本前先运行此脚本
+
+5. **`data_loader.py`** - 数据加载模块
+   - **作用**: 统一处理多种格式的NER数据加载
+   - **功能**:
+     - 支持JSON数组格式
+     - 支持BIO格式（MSRA格式）
+     - 支持CCKS JSON格式
+     - 支持CCKS BIO格式
+     - 自动检测文件编码（UTF-8, GBK, GB2312等）
+     - 从多个数据目录自动加载数据
 
 ## 技术思路
 
@@ -119,18 +154,46 @@ print(entities)  # ['阿利·伯克级驱逐舰', '宙斯盾作战系统', 'AN/S
 
 #### 步骤1: 准备训练数据
 
-确保训练数据位于：`./../data/nerdata/train.txt`（相对于脚本所在目录）
+脚本支持从多个数据目录自动加载数据，支持多种数据格式：
 
-数据格式要求：
+**1. traindata目录（JSON数组格式）**
+- 路径：`./../data/traindata/`
+- 格式：
 ```json
-{
-  "content": "文本内容",
-  "result_list": [
-    {"text": "实体文本", "start": 开始位置, "end": 结束位置, "url": "链接（可选）"}
-  ],
-  "prompt": "实体类型（可选）"
-}
+[
+  {
+    "text": "文本内容",
+    "entities": [
+      {
+        "start": 0,
+        "end": 5,
+        "text": "实体文本",
+        "type": "实体类型"
+      }
+    ],
+    "sample_id": 1
+  }
+]
 ```
+- 文件命名：`*_ner_train.json`（训练）、`*_ner_dev.json`（验证）
+
+**2. ccks_ner目录（CCKS格式）**
+- 路径：`./../data/ccks_ner/militray/PreModel_Encoder_CRF/ccks_8_data_v2/`
+- 格式：单个JSON文件，包含text和entities字段
+- 文件：`train/*.json`（训练）、`validate_data.json`（验证）
+
+**3. nlp_datasets目录（BIO格式）**
+- 路径：`./../data/nlp_datasets/ner/msra/`
+- 格式：每行"字符\t标签"（MSRA格式）
+- 文件：`msra_train_bio.txt`（训练）、`msra_test_bio.txt`（验证）
+
+**支持的实体类型**：
+- 火炮、军工企业、军用舰艇、军事组织、枪械
+- 军用航空器、军用车辆、武器系统、导弹、信息系统
+- 地缘政治实体、军事系统、无人机、弹药、军事地点
+- 以及其他在数据中出现的实体类型（会自动识别和合并）
+
+**注意**：脚本会自动从所有存在的目录加载数据并合并，无需手动配置。
 
 #### 步骤2: 微调模型
 
@@ -139,10 +202,19 @@ cd work_wyy/ner
 python finetune_ner_model.py
 ```
 
-训练参数可在脚本中修改：
+**训练参数可在脚本中修改**：
 - `NUM_EPOCHS`: 训练轮数（默认5）
 - `BATCH_SIZE`: 批次大小（默认8）
 - `LEARNING_RATE`: 学习率（默认2e-5）
+- `MAX_LENGTH`: 最大序列长度（默认512）
+
+**新功能**：
+- 支持多种数据格式（JSON数组、BIO格式、CCKS格式）
+- 自动从多个数据目录加载数据（traindata、ccks_ner、nlp_datasets）
+- 自动识别数据中的所有实体类型
+- 动态构建BIO标签映射（支持多种实体类型）
+- 自动合并多个训练文件
+- 保存标签映射信息到模型目录
 
 #### 步骤3: 使用微调后的模型
 
@@ -162,14 +234,16 @@ python diagnose_ner_model.py
 - 标签对齐的准确性
 - 模型预测的详细输出
 
-### 验证标签对齐
+### 检查前置条件
 
-在训练前，可以验证标签对齐是否正确：
+在训练前，运行前置条件检查：
 
 ```bash
 cd work_wyy/ner
-python verify_label_alignment.py
+python check_prerequisites.py
 ```
+
+这会检查所有必要的条件和数据，确保训练可以正常进行。
 
 ## 效果说明
 
@@ -220,10 +294,10 @@ python verify_label_alignment.py
    - 使用GPU时建议至少6GB显存
    - 如果内存不足，可以减小 `BATCH_SIZE` 或 `MAX_LENGTH`
 
-5. **标签对齐**: 
-   - 标签对齐是NER训练的关键步骤
-   - 如果对齐不准确，模型学习的是错误的标签
-   - 建议在训练前运行 `verify_label_alignment.py` 检查对齐准确性
+5. **数据格式**: 
+   - 支持多种数据格式（JSON数组、BIO格式、CCKS格式）
+   - 自动检测文件编码（UTF-8, GBK, GB2312等）
+   - 如果遇到编码错误，代码会自动尝试其他编码
 
 ## 故障排除
 
@@ -245,10 +319,11 @@ python verify_label_alignment.py
 - 检查是否有足够的磁盘空间保存模型
 - 如果显存不足，减小 `BATCH_SIZE`
 
-### 标签对齐错误
+### 编码错误
 
-- 运行 `verify_label_alignment.py` 检查对齐准确性
-- 如果对齐错误率高，可能需要优化对齐方法
+- 如果遇到 `UnicodeDecodeError`，代码会自动尝试多种编码
+- 如果所有编码都失败，会在日志中记录错误并跳过该文件
+- 检查日志文件 `ner_finetune.log` 查看详细错误信息
 
 ## 文件结构
 
@@ -258,16 +333,37 @@ work_wyy/
 │   ├── ner_extract_entities.py      # NER实体提取核心模块
 │   ├── finetune_ner_model.py        # NER模型微调脚本
 │   ├── diagnose_ner_model.py        # NER模型诊断脚本
-│   ├── verify_label_alignment.py    # 标签对齐验证脚本
-│   └── README.md                     # 本文档
+│   ├── check_prerequisites.py       # 前置条件检查脚本
+│   ├── data_loader.py               # 数据加载模块（统一处理多种格式）
+│   ├── README.md                     # 本文档
+│   └── 训练与使用文档.md            # 完整训练与使用指南
+├── vector/
+│   └── vector2ES.py                  # 向量化数据并存入ES（已更新使用微调模型）
+├── vector_model.py                  # 统一向量生成模块（支持微调后的模型）
+├── auto_pipeline.py                 # 自动化流水线脚本
+├── search_vllm.py                  # 向量检索系统（已更新使用微调模型）
 ├── model/
-│   ├── chinese-roberta-wwm-ext-large/  # 基础NER模型
-│   └── ner_finetuned/                 # 微调后的模型（训练后生成）
+│   ├── chinese-roberta-wwm-ext-large/  # 基础模型
+│   └── ner_finetuned/                 # 微调后的NER模型（用于NER和向量生成）
+│       ├── config.json
+│       ├── pytorch_model.bin
+│       ├── tokenizer.json
+│       └── label_mapping.json         # 标签映射文件
 └── data/
-    └── nerdata/
-        ├── train.txt                  # 训练数据
-        ├── dev.txt                    # 验证数据（可选）
-        └── test.txt                   # 测试数据（可选）
+    ├── traindata/                     # 训练数据目录（JSON格式）
+    │   ├── *_ner_train.json          # 训练文件
+    │   └── *_ner_dev.json            # 验证文件
+    ├── ccks_ner/                     # CCKS NER数据集
+    │   └── militray/                 # 军事领域数据
+    │       └── PreModel_Encoder_CRF/
+    │           └── ccks_8_data_v2/
+    │               ├── train/        # 训练数据（JSON文件）
+    │               └── validate_data.json  # 验证数据
+    └── nlp_datasets/                 # NLP数据集
+        └── ner/
+            └── msra/                 # MSRA数据集（已禁用）
+                ├── msra_train_bio.txt  # 训练数据（BIO格式）
+                └── msra_test_bio.txt   # 测试数据（BIO格式）
 ```
 
 ## 更新日志
@@ -277,4 +373,25 @@ work_wyy/
   - 添加标签对齐验证功能
   - 添加模型诊断功能
   - 统一文档说明
+- **2025-12-03 (更新)**:
+  - 支持多种数据格式（JSON数组、BIO格式、CCKS格式）
+  - 支持从多个数据目录自动加载数据（traindata、ccks_ner、nlp_datasets）
+  - 动态构建标签映射，支持多种实体类型
+  - 添加数据集获取指南文档
+- **2025-12-08 (重构)**:
+  - 重构代码，将数据加载逻辑提取到 `data_loader.py` 模块
+  - 添加 `check_prerequisites.py` 前置条件检查脚本
+  - 删除重复文件（`check_entity_types.py`, `verify_label_alignment.py`）
+  - 完善编码错误处理，自动检测文件编码
+  - 优化代码结构，提高可维护性
+- **2025-12-08 (文档完善)**:
+  - 创建完整的训练与使用文档，包含训练数据说明、效果评估、集成方案
+  - 训练完成：F1-Score 98.26%，支持27种实体类型
+  - 添加与 `search_vllm.py` 向量检索系统的集成指南
+- **2025-12-08 (向量生成更新)**:
+  - **重要**: 所有向量生成代码已更新，优先使用微调后的NER模型
+  - 新增 `vector_model.py` 统一向量生成模块，支持从NER模型中提取encoder用于向量生成
+  - 更新 `search_vllm.py` 和 `vector/vector2ES.py` 使用新的向量生成模块
+  - 新增 `auto_pipeline.py` 自动化流水线脚本
+  - 删除临时文档（数据格式分析、数据集获取指南）
 

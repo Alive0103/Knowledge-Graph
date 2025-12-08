@@ -10,7 +10,7 @@ NER模型微调脚本
 import json
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import (
     BertTokenizer, 
     BertForTokenClassification,
@@ -20,9 +20,10 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import numpy as np
-from tqdm import tqdm
 import logging
-from collections import Counter
+
+# 导入数据加载模块
+from data_loader import load_all_data_from_directories
 
 # 配置日志
 log_file = os.path.join(os.path.dirname(__file__), 'ner_finetune.log')
@@ -44,84 +45,70 @@ BATCH_SIZE = 8
 LEARNING_RATE = 2e-5
 NUM_EPOCHS = 5  # 增加到5轮，确保充分训练
 
-# 实体类型标签映射（BIO格式）
-LABEL_TO_ID = {
-    'O': 0,  # Outside
-    'B-ENTITY': 1,  # Begin
-    'I-ENTITY': 2,  # Inside
-}
+# 预定义的实体类型（根据用户需求）
+ENTITY_TYPES = [
+    "火炮", "军工企业", "军用舰艇", "军事组织", "枪械",
+    "军用航空器", "军用车辆", "武器系统", "导弹", "信息系统",
+    "地缘政治实体", "军事系统", "无人机", "弹药", "军事地点",
+    "装甲车辆"  # 数据中已有的类型
+]
+
+# 动态构建标签映射（BIO格式）
+def build_label_mapping(entity_types):
+    """构建BIO格式的标签映射"""
+    label_to_id = {'O': 0}
+    label_id = 1
+    
+    # 为每个实体类型创建B和I标签
+    for entity_type in entity_types:
+        label_to_id[f'B-{entity_type}'] = label_id
+        label_id += 1
+        label_to_id[f'I-{entity_type}'] = label_id
+        label_id += 1
+    
+    return label_to_id
+
+# 初始化标签映射（将在加载数据后更新）
+LABEL_TO_ID = build_label_mapping(ENTITY_TYPES)
 ID_TO_LABEL = {v: k for k, v in LABEL_TO_ID.items()}
 NUM_LABELS = len(LABEL_TO_ID)
 
 
-def load_ner_data(file_path):
-    """
-    加载NER训练数据
+def compute_metrics(eval_pred):
+    """计算评估指标"""
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=2)
     
-    Args:
-        file_path: 训练数据文件路径
+    # 展平
+    true_labels = labels.flatten()
+    pred_labels = predictions.flatten()
     
-    Returns:
-        examples: 数据列表，每个元素包含text和labels
-    """
-    examples = []
+    # 移除padding标签（-100）
+    mask = true_labels != -100
+    true_labels = true_labels[mask]
+    pred_labels = pred_labels[mask]
     
-    if not os.path.exists(file_path):
-        logger.warning(f"文件不存在: {file_path}")
-        return examples
+    accuracy = accuracy_score(true_labels, pred_labels)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        true_labels, pred_labels, average='weighted', zero_division=0
+    )
     
-    logger.info(f"加载数据文件: {file_path}")
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                if not line.strip():
-                    continue
-                
-                data = json.loads(line.strip())
-                content = data.get('content', '')
-                result_list = data.get('result_list', [])
-                
-                if not content or not result_list:
-                    continue
-                
-                # 创建标签序列（初始化为O）
-                labels = ['O'] * len(content)
-                
-                # 标记实体
-                for entity in result_list:
-                    start = entity.get('start', -1)
-                    end = entity.get('end', -1)
-                    text = entity.get('text', '')
-                    
-                    if start >= 0 and end > start and end <= len(content):
-                        # 标记B-ENTITY
-                        labels[start] = 'B-ENTITY'
-                        # 标记I-ENTITY（如果有多个字符）
-                        for i in range(start + 1, end):
-                            if i < len(labels):
-                                labels[i] = 'I-ENTITY'
-                
-                examples.append({
-                    'text': content,
-                    'labels': labels
-                })
-                
-            except Exception as e:
-                logger.warning(f"第{line_num}行解析失败: {e}")
-                continue
-    
-    logger.info(f"成功加载 {len(examples)} 条数据")
-    return examples
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 
 class NERDataset(Dataset):
     """NER数据集类"""
     
-    def __init__(self, examples, tokenizer, max_length=512):
+    def __init__(self, examples, tokenizer, max_length=512, label_to_id=None):
         self.examples = examples
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.label_to_id = label_to_id or LABEL_TO_ID
     
     def __len__(self):
         return len(self.examples)
@@ -131,7 +118,7 @@ class NERDataset(Dataset):
         text = example['text']
         labels = example['labels']
         
-        # Tokenize（不使用offset_mapping，因为Python tokenizer不支持）
+        # Tokenize
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -140,7 +127,7 @@ class NERDataset(Dataset):
             return_tensors='pt'
         )
         
-        # 将字符级标签转换为token级标签（不使用offset_mapping）
+        # 将字符级标签转换为token级标签
         input_ids = encoding['input_ids'][0].tolist()
         tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
         token_labels = self.align_labels_with_tokens(
@@ -158,12 +145,7 @@ class NERDataset(Dataset):
     
     def align_labels_with_tokens(self, char_labels, text, tokens, input_ids):
         """
-        将字符级标签对齐到token级标签（改进版，更精确）
-        
-        使用更精确的方法：
-        1. 通过tokenizer的decode重建文本片段
-        2. 使用字符级别的精确匹配
-        3. 处理中文和英文的差异
+        将字符级标签对齐到token级标签
         
         Args:
             char_labels: 字符级标签列表
@@ -175,13 +157,12 @@ class NERDataset(Dataset):
             token_labels: token级标签列表
         """
         token_labels = []
-        text_chars = list(text)  # 转换为字符列表，便于处理中文
-        char_idx = 0  # 当前字符索引
+        char_idx = 0
         
         for i, token in enumerate(tokens):
             # 跳过特殊token
             if token in ['[CLS]', '[SEP]', '[PAD]', '<pad>', '<s>', '</s>', '[UNK]']:
-                token_labels.append(LABEL_TO_ID['O'])
+                token_labels.append(self.label_to_id.get('O', 0))
                 continue
             
             # 处理BERT子词标记
@@ -189,30 +170,26 @@ class NERDataset(Dataset):
             clean_token = token.replace('##', '').replace('▁', '').strip()
             
             if not clean_token:
-                token_labels.append(LABEL_TO_ID['O'])
+                token_labels.append(self.label_to_id.get('O', 0))
                 continue
             
             # 尝试找到token在文本中的位置
             found = False
             best_match_pos = -1
-            
-            # 搜索范围：从当前位置向前向后搜索
             search_start = max(0, char_idx - 20)
             search_end = min(len(text), char_idx + 50)
             
-            # 方法1：精确字符串匹配
+            # 精确字符串匹配
             for pos in range(search_start, search_end):
                 if pos + len(clean_token) <= len(text):
                     if text[pos:pos + len(clean_token)] == clean_token:
                         best_match_pos = pos
                         found = True
-                        # 如果找到的匹配位置在当前位置附近，优先使用
                         if abs(pos - char_idx) < 10:
                             break
             
-            # 方法2：如果精确匹配失败，尝试字符级匹配（处理中文）
+            # 字符级匹配（处理中文）
             if not found and len(clean_token) > 0:
-                # 对于中文，尝试逐字符匹配
                 for pos in range(search_start, min(search_end, len(text) - len(clean_token) + 1)):
                     match = True
                     for j, char in enumerate(clean_token):
@@ -226,29 +203,25 @@ class NERDataset(Dataset):
                             break
             
             if found and best_match_pos >= 0:
-                # 使用找到位置的标签
                 if best_match_pos < len(char_labels):
                     char_label = char_labels[best_match_pos]
-                    token_labels.append(LABEL_TO_ID.get(char_label, LABEL_TO_ID['O']))
-                    # 更新字符索引：完整词移动到匹配位置之后，子词不移动
+                    token_labels.append(self.label_to_id.get(char_label, self.label_to_id.get('O', 0)))
                     if not is_subword:
                         char_idx = best_match_pos + len(clean_token)
                 else:
-                    token_labels.append(LABEL_TO_ID['O'])
+                    token_labels.append(self.label_to_id.get('O', 0))
             else:
-                # 如果找不到匹配，使用当前位置的标签
                 if char_idx < len(char_labels):
                     char_label = char_labels[char_idx]
-                    token_labels.append(LABEL_TO_ID.get(char_label, LABEL_TO_ID['O']))
-                    # 保守地向前移动
+                    token_labels.append(self.label_to_id.get(char_label, self.label_to_id.get('O', 0)))
                     if not is_subword:
                         char_idx = min(char_idx + 1, len(text))
                 else:
-                    token_labels.append(LABEL_TO_ID['O'])
+                    token_labels.append(self.label_to_id.get('O', 0))
         
         # 确保长度匹配
         while len(token_labels) < len(input_ids):
-            token_labels.append(LABEL_TO_ID['O'])
+            token_labels.append(self.label_to_id.get('O', 0))
         if len(token_labels) > len(input_ids):
             token_labels = token_labels[:len(input_ids)]
         
@@ -288,6 +261,39 @@ def main():
     logger.info("NER模型微调")
     logger.info("=" * 70)
     
+    # 数据目录（从多个目录加载数据）
+    base_data_dir = "./../data"
+    
+    # 从所有数据目录加载数据（使用data_loader模块）
+    logger.info("从多个数据目录加载数据...")
+    train_examples, dev_examples, all_entity_types = load_all_data_from_directories(base_data_dir)
+    
+    if not train_examples:
+        logger.error("未加载到训练数据")
+        return
+    
+    # 动态更新标签映射
+    if all_entity_types:
+        logger.info("更新标签映射以包含所有实体类型...")
+        # 确保包含预定义的实体类型
+        all_entity_types.update(ENTITY_TYPES)
+        global LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
+        LABEL_TO_ID = build_label_mapping(sorted(all_entity_types))
+        ID_TO_LABEL = {v: k for k, v in LABEL_TO_ID.items()}
+        NUM_LABELS = len(LABEL_TO_ID)
+        logger.info(f"标签映射已更新: {NUM_LABELS} 个标签")
+        logger.info(f"实体类型: {', '.join(sorted(all_entity_types))}")
+    
+    # 如果没有验证集，从训练集中划分（80/20）
+    if not dev_examples and len(train_examples) > 10:
+        split_idx = int(0.8 * len(train_examples))
+        dev_examples = train_examples[split_idx:]
+        train_examples = train_examples[:split_idx]
+        logger.info(f"从训练集中划分验证集: 训练集 {len(train_examples)} 条, 验证集 {len(dev_examples)} 条")
+    
+    logger.info(f"训练集: {len(train_examples)} 条")
+    logger.info(f"验证集: {len(dev_examples)} 条")
+    
     # 检查模型路径
     if not os.path.exists(MODEL_NAME):
         logger.error(f"模型路径不存在: {MODEL_NAME}")
@@ -309,34 +315,9 @@ def main():
     logger.info(f"使用设备: {device}")
     model.to(device)
     
-    # 加载数据（使用相对路径）
-    train_file = "./../data/nerdata/train.txt"
-    dev_file = "./../data/nerdata/dev.txt"
-    test_file = "./../data/nerdata/test.txt"
-    
-    train_examples = load_ner_data(train_file)
-    dev_examples = load_ner_data(dev_file)
-    test_examples = load_ner_data(test_file)
-    
-    if not train_examples:
-        logger.error("未加载到训练数据")
-        return
-    
-    # 如果没有验证集，从训练集中划分（80/20）
-    if not dev_examples and len(train_examples) > 10:
-        split_idx = int(0.8 * len(train_examples))
-        dev_examples = train_examples[split_idx:]
-        train_examples = train_examples[:split_idx]
-        logger.info(f"从训练集中划分验证集: 训练集 {len(train_examples)} 条, 验证集 {len(dev_examples)} 条")
-    
-    logger.info(f"训练集: {len(train_examples)} 条")
-    logger.info(f"验证集: {len(dev_examples)} 条")
-    logger.info(f"测试集: {len(test_examples)} 条")
-    
-    # 创建数据集
-    train_dataset = NERDataset(train_examples, tokenizer, MAX_LENGTH)
-    dev_dataset = NERDataset(dev_examples, tokenizer, MAX_LENGTH) if dev_examples else None
-    test_dataset = NERDataset(test_examples, tokenizer, MAX_LENGTH) if test_examples else None
+    # 创建数据集（传入更新后的标签映射）
+    train_dataset = NERDataset(train_examples, tokenizer, MAX_LENGTH, LABEL_TO_ID)
+    dev_dataset = NERDataset(dev_examples, tokenizer, MAX_LENGTH, LABEL_TO_ID) if dev_examples else None
     
     # 数据整理器
     data_collator = DataCollatorForTokenClassification(tokenizer)
@@ -380,11 +361,17 @@ def main():
     trainer.save_model()
     tokenizer.save_pretrained(OUTPUT_DIR)
     
-    # 评估测试集
-    if test_examples:
-        logger.info("评估测试集...")
-        test_results = trainer.evaluate(test_dataset)
-        logger.info(f"测试集结果: {test_results}")
+    # 保存标签映射信息
+    label_info = {
+        'label_to_id': LABEL_TO_ID,
+        'id_to_label': ID_TO_LABEL,
+        'entity_types': sorted(all_entity_types),
+        'num_labels': NUM_LABELS
+    }
+    label_info_path = os.path.join(OUTPUT_DIR, 'label_mapping.json')
+    with open(label_info_path, 'w', encoding='utf-8') as f:
+        json.dump(label_info, f, ensure_ascii=False, indent=2)
+    logger.info(f"标签映射信息已保存到: {label_info_path}")
     
     logger.info("=" * 70)
     logger.info("微调完成!")

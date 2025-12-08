@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+向量检索与LLM重排序系统
+
+支持5种检索方案对比：
+1. vector_only: 纯向量检索
+2. es_text_only: 纯ES文本搜索
+3. llm_only: 纯LLM判断
+4. vector_with_llm_always: 向量+LLM（始终重排序）
+5. vector_with_llm: 向量+LLM（智能混合模式，推荐）
+
+详细说明请参考：检索方案对比说明.md
+"""
+
 import torch
 from transformers import BertTokenizer, BertModel
 from zhipuai import ZhipuAI
@@ -11,43 +26,84 @@ from tqdm import tqdm
 import concurrent.futures
 import json
 import os
+import sys
 from datetime import datetime
+
+# 获取脚本所在目录（work_wyy）
+script_dir_search = os.path.dirname(os.path.abspath(__file__))
+
+# 创建 trainlog 文件夹（如果不存在）
+trainlog_dir = os.path.join(script_dir_search, 'trainlog')
+os.makedirs(trainlog_dir, exist_ok=True)
+
+# 创建日志文件名（保存到 trainlog 文件夹）
+log_filename = os.path.join(trainlog_dir, f'vector_search_test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+console_log_file = os.path.join(trainlog_dir, f'search_vllm_console_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
 
 # 配置日志记录
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('vector_search_test.log', encoding='utf-8'),
+        logging.FileHandler(log_filename, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# 模型加载（用于向量生成，支持 GPU 加速）
-model_name = './model/chinese-roberta-wwm-ext-large'
-model = None
-tokenizer = None
-device = torch.device("cpu")
+# 创建Tee类，同时输出到控制台和文件
+class Tee:
+    """同时将输出写入文件和控制台"""
+    def __init__(self, file_path, mode='a', encoding='utf-8'):
+        self.file = open(file_path, mode, encoding=encoding)
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        
+    def write(self, text):
+        self.file.write(text)
+        self.file.flush()  # 立即刷新到文件
+        self.stdout.write(text)
+        self.stdout.flush()
+        
+    def flush(self):
+        self.file.flush()
+        self.stdout.flush()
+        
+    def close(self):
+        if self.file:
+            self.file.close()
+
+# 重定向stdout和stderr到文件和控制台
+tee = Tee(console_log_file, mode='w')
+sys.stdout = tee
+sys.stderr = tee
+
+logger.info(f"所有控制台输出将同时保存到: {console_log_file}")
+logger.info(f"日志信息保存到: {log_filename}")
+
+# 使用统一的向量生成模块（支持微调后的模型）
 try:
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    model = BertModel.from_pretrained(model_name)
-    model.eval()
-
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-        print(f"✅ 检测到 GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-    else:
-        device = torch.device("cpu")
-        print("⚠️ 未检测到 GPU，使用 CPU 进行在线向量检索（性能会略慢）")
-
-    model = model.to(device)
-    model_dimension = model.config.hidden_size
-    print(f"✓ Chinese-RoBERTa模型加载成功 (维度: {model_dimension}, 设备: {device})")
+    from vector_model import load_vector_model, generate_vector as _generate_vector_module, batch_generate_vectors
+    model, tokenizer, device = load_vector_model(use_finetuned=True)
+    print(f"✓ 向量生成模型加载成功 (使用微调后的模型，设备: {device})")
 except Exception as e:
-    print(f"警告: 模型加载失败 ({e})，向量生成功能将不可用")
+    print(f"警告: 向量生成模型加载失败 ({e})，尝试使用基础模型")
+    try:
+        model_name = './model/chinese-roberta-wwm-ext-large'
+        tokenizer = BertTokenizer.from_pretrained(model_name)
+        model = BertModel.from_pretrained(model_name)
+        model.eval()
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+        model = model.to(device)
+        print(f"✓ 基础模型加载成功 (设备: {device})")
+    except Exception as e2:
+        print(f"错误: 基础模型也加载失败 ({e2})，向量生成功能将不可用")
+        model = None
+        tokenizer = None
+        device = torch.device("cpu")
 
 # 智谱AI API客户端
 client = ZhipuAI(api_key="1a2a485fe1fc4bd5aa0d965bf452c8c8.se8RZdT8cH8skEDo")
@@ -86,15 +142,12 @@ def preprocess_query(query):
 
 def _batch_generate_vectors_internal(texts, use_cache=True, batch_size=None):
     """
-    批量生成 1024 维向量（仅用于评测加速）
+    批量生成 1024 维向量（使用统一的向量生成模块，支持微调后的模型）
 
-    - 复用当前已加载的 model / tokenizer / device
+    - 使用统一的向量生成模块
     - 自动处理 768/1024 维模型到 1024 维
     - 做 L2 归一化
     """
-    if model is None or tokenizer is None:
-        return [None] * len(texts)
-
     if batch_size is None:
         batch_size = _batch_size_for_eval
 
@@ -118,56 +171,58 @@ def _batch_generate_vectors_internal(texts, use_cache=True, batch_size=None):
     if not to_compute_texts:
         return results
 
-    target_dim = 1024
-
-    for start in range(0, len(to_compute_texts), batch_size):
-        end = start + batch_size
-        batch_texts = to_compute_texts[start:end]
-        if not batch_texts:
-            continue
-
-        inputs = tokenizer(
-            batch_texts,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=512
+    # 使用统一的批量向量生成模块
+    try:
+        batch_vectors = batch_generate_vectors(
+            to_compute_texts,
+            use_finetuned=True,
+            target_dim=1024,
+            batch_size=batch_size
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-        # [B, H]
-        vectors = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-
-        for j in range(vectors.shape[0]):
-            v = vectors[j]
-            # 处理维度为 1024
-            vec_dim = len(v)
-            if vec_dim == target_dim:
-                pass
-            elif vec_dim < target_dim:
-                v = np.pad(v, (0, target_dim - vec_dim), 'constant', constant_values=0)
-            else:
-                v = v[:target_dim]
-
-            # L2 归一化
-            norm = np.linalg.norm(v)
-            if norm > 0:
-                v = v / norm
-            v_list = v.astype(float).tolist()
-
-            global_idx = to_compute_indices[start + j]
-            results[global_idx] = v_list
-            if use_cache:
-                _vector_cache[str(texts[global_idx])] = v_list
+        
+        for j, vec in enumerate(batch_vectors):
+            if vec is not None:
+                global_idx = to_compute_indices[j]
+                results[global_idx] = vec
+                if use_cache:
+                    _vector_cache[str(texts[global_idx])] = vec
+    except:
+        # 回退到原始方法
+        if model is None or tokenizer is None:
+            return results
+        target_dim = 1024
+        for start in range(0, len(to_compute_texts), batch_size):
+            end = start + batch_size
+            batch_texts = to_compute_texts[start:end]
+            if not batch_texts:
+                continue
+            inputs = tokenizer(batch_texts, return_tensors='pt', padding=True, truncation=True, max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = model(**inputs)
+            vectors = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            for j in range(vectors.shape[0]):
+                v = vectors[j]
+                vec_dim = len(v)
+                if vec_dim < target_dim:
+                    v = np.pad(v, (0, target_dim - vec_dim), 'constant', constant_values=0)
+                else:
+                    v = v[:target_dim]
+                norm = np.linalg.norm(v)
+                if norm > 0:
+                    v = v / norm
+                v_list = v.astype(float).tolist()
+                global_idx = to_compute_indices[start + j]
+                results[global_idx] = v_list
+                if use_cache:
+                    _vector_cache[str(texts[global_idx])] = v_list
 
     return results
 
 
 def generate_vector(text, use_cache=True):
     """
-    生成文本向量（需要模型已加载）
+    生成文本向量（使用统一的向量生成模块，支持微调后的模型）
 
     Args:
         text: 输入文本
@@ -179,7 +234,7 @@ def generate_vector(text, use_cache=True):
     # 预处理文本
     text = preprocess_query(text)
 
-    if not text or model is None or tokenizer is None:
+    if not text:
         return None
 
     # 使用缓存
@@ -188,36 +243,37 @@ def generate_vector(text, use_cache=True):
         if cache_key in _vector_cache:
             return _vector_cache[cache_key]
 
-    # 生成向量
-    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = model(**inputs)
-    vector = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-
-    # L2归一化
-    norm = np.linalg.norm(vector)
-    if norm > 0:
-        vector = vector / norm
-
-    # 处理维度问题：ES需要1024维向量
-    vector_dim = len(vector)
-    target_dim = 1024
-
-    if vector_dim == target_dim:
-        pass
-    elif vector_dim < target_dim:
-        vector = np.pad(vector, (0, target_dim - vector_dim), 'constant', constant_values=0)
+    # 使用统一的向量生成模块
+    try:
+        vector_list = _generate_vector_module(text, use_finetuned=True, target_dim=1024)
+    except:
+        # 如果模块不可用，回退到原始方法
+        if model is None or tokenizer is None:
+            return None
+        inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        vector = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
         norm = np.linalg.norm(vector)
         if norm > 0:
             vector = vector / norm
-    else:
-        vector = vector[:target_dim]
-        norm = np.linalg.norm(vector)
-        if norm > 0:
-            vector = vector / norm
+        vector_dim = len(vector)
+        target_dim = 1024
+        if vector_dim < target_dim:
+            vector = np.pad(vector, (0, target_dim - vector_dim), 'constant', constant_values=0)
+            norm = np.linalg.norm(vector)
+            if norm > 0:
+                vector = vector / norm
+        elif vector_dim > target_dim:
+            vector = vector[:target_dim]
+            norm = np.linalg.norm(vector)
+            if norm > 0:
+                vector = vector / norm
+        vector_list = vector.tolist()
 
-    vector_list = vector.tolist()
+    if vector_list is None:
+        return None
 
     # 添加到缓存
     if use_cache:
@@ -475,13 +531,78 @@ def ensure_links_match(sorted_links, original_links):
     return matched_links
 
 
-def generate_prompt_and_sort_with_description(mention, results):
+def llm_search_direct_from_es(query, top_k=30):
+    """
+    直接从ES获取候选，使用LLM判断匹配度（不依赖向量检索结果）
+    
+    Args:
+        query: 查询文本
+        top_k: 从ES获取的候选数量
+    
+    Returns:
+        排序后的链接列表
+    """
+    # 预处理查询
+    query = preprocess_query(query)
+    
+    if not query:
+        return []
+    
+    # 从ES获取候选（使用文本搜索，不依赖向量）
+    try:
+        # 使用match查询获取候选
+        search_body = {
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["label^3", "aliases_zh^2", "aliases_en^2", "descriptions_zh", "descriptions_en"],
+                    "type": "best_fields",
+                    "operator": "or"
+                }
+            },
+            "size": top_k
+        }
+        
+        resp = es.search(index="data2", body=search_body)
+        hits = resp.get("hits", {}).get("hits", []) or []
+        
+        if not hits:
+            logger.warning(f"ES文本搜索未找到候选 for query '{query}'")
+            return []
+        
+        # 构建结果列表
+        results = []
+        for hit in hits:
+            source = hit.get("_source", {})
+            result = {
+                "label": source.get("label", ""),
+                "aliases_zh": source.get("aliases_zh", []),
+                "aliases_en": source.get("aliases_en", []),
+                "descriptions_zh": source.get("descriptions_zh", ""),
+                "descriptions_en": source.get("descriptions_en", ""),
+                "link": source.get("link", ""),
+                "_score": hit.get("_score", 0.0)
+            }
+            results.append(result)
+        
+        logger.info(f"从ES获取 {len(results)} 个候选（文本搜索）")
+        
+    except Exception as e:
+        logger.error(f"ES文本搜索失败: {e}")
+        return []
+    
+    # 使用LLM判断匹配度
+    return generate_prompt_and_sort_with_description(query, results, use_vector_results=False)
+
+
+def generate_prompt_and_sort_with_description(mention, results, use_vector_results=True):
     """
     使用LLM重排序，重点使用完整的描述信息进行匹配
 
     Args:
         mention: 查询提及
-        results: 向量检索结果列表
+        results: 向量检索结果列表（如果use_vector_results=False，则results来自ES文本搜索）
+        use_vector_results: 是否使用向量检索结果（False时表示直接从ES获取的候选）
 
     Returns:
         排序后的链接列表
@@ -564,13 +685,25 @@ def generate_prompt_and_sort_with_description(mention, results):
         options.append(option)
         original_links.append(result.get('link', ''))
 
+    # 构建prompt，根据是否使用向量检索结果调整提示
+    if use_vector_results:
+        context_note = "（这些候选来自向量相似度检索）"
+        match_instruction = "请根据输入信息与选项的匹配度（特别关注中英文描述信息的匹配度），从高到低严格返回所有候选的link值。"
+    else:
+        context_note = "（这些候选来自ES文本搜索，请直接根据查询词和描述的语义匹配度进行判断，不考虑向量相似度）"
+        match_instruction = "请直接比较查询词与每个选项的描述信息的语义匹配度，从高到低严格返回所有候选的link值。不要考虑向量相似度分数，只根据文本语义进行判断。"
+    
     # 构建prompt，明确强调要使用描述信息进行匹配（中英文）
     prompt = (
-        f"现在你是军事领域专家，需要根据输入信息与选项列表的候选的匹配度进行从高到低排序。\n\n"
+        f"现在你是军事领域专家，需要根据输入查询词与选项列表中每个候选的描述信息进行匹配度判断，然后从高到低排序。{context_note}\n\n"
         f"【重要提示】请重点参考每个选项的完整描述信息（包括中文描述descriptions_zh和英文描述descriptions_en）进行匹配度判断，"
         f"描述信息包含了实体的详细特征和定义，比标签和别名更能准确反映实体的本质特征。在判断匹配度时，描述信息的权重应该高于标签和别名。\n\n"
-        f"输入信息：\n"
-        f"  标签名：{input_label}\n"
+        f"【匹配原则】\n"
+        f"1. 直接比较查询词（{input_label}）与每个选项的描述信息（descriptions_zh和descriptions_en）的语义匹配度\n"
+        f"2. 如果查询词中的关键词在描述中出现，或者描述中提到的实体特征与查询词相关，则匹配度较高\n"
+        f"3. 不要考虑向量相似度分数，只根据文本语义进行判断\n\n"
+        f"输入查询词：{input_label}\n"
+        f"查询词相关信息：\n"
         f"  中文别名：{input_aliases_zh if input_aliases_zh else '无'}\n"
         f"  英文别名：{input_aliases_en if input_aliases_en else '无'}\n"
         f"  中文定义：{input_definition_zh if input_definition_zh else '无'}\n"
@@ -579,7 +712,7 @@ def generate_prompt_and_sort_with_description(mention, results):
         f"  英文详细描述：{input_description_en if input_description_en else '无'}\n\n"
         f"选项列表：\n"
         f"{''.join(options)}\n\n"
-        f"请根据输入信息与选项的匹配度（特别关注中英文描述信息的匹配度），从高到低严格返回所有候选的link值。\n"
+        f"{match_instruction}\n"
         f"【重要要求】\n"
         f"1. 必须返回所有{len(options)}个选项的link值，不能有缺失\n"
         f"2. 每个link值只能出现一次，不能有重复\n"
@@ -710,7 +843,12 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
     Args:
         queries: 查询列表
         correct_links: 正确链接列表
-        search_mode: 检索模式 ("vector_only", "vector_with_llm")
+        search_mode: 检索模式，支持以下模式：
+            - "vector_only": 方案1 - 纯向量检索（无LLM）
+            - "es_text_only": 方案2 - 纯ES文本搜索（不使用向量，不使用LLM）
+            - "llm_only": 方案3 - 纯LLM判断（直接从ES获取候选，用LLM判断）
+            - "vector_with_llm_always": 方案4 - 始终使用LLM重排序向量结果
+            - "vector_with_llm": 方案5 - 向量检索+LLM（智能混合模式）
     """
     mrr = 0
     hit_at_1 = 0
@@ -739,16 +877,72 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
         try:
             # 根据不同模式选择不同的搜索函数
             if search_mode == "vector_only":
-                # 纯向量检索，不使用 LLM 重排序，直接按 ES 返回顺序（按相似度分数排序）
+                # 方案1: 纯向量检索，不使用 LLM 重排序，直接按 ES 返回顺序（按相似度分数排序）
                 pre_vec = precomputed_map.get(str(query))
                 results = vector_search(query, top_k=30, query_vector=pre_vec)  # 增加top_k到30
                 # 直接按 ES 返回的顺序（已经按相似度分数排序）
                 sorted_links = [r.get("link", "") for r in results]
-            else:  # vector_with_llm
-                # 向量检索 + LLM重排序（使用完整描述信息）
+                
+            elif search_mode == "es_text_only":
+                # 方案2: 纯ES文本搜索（不使用向量，不使用LLM）
+                try:
+                    search_body = {
+                        "query": {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["label^3", "aliases_zh^2", "aliases_en^2", "descriptions_zh", "descriptions_en"],
+                                "type": "best_fields",
+                                "operator": "or"
+                            }
+                        },
+                        "size": 30
+                    }
+                    resp = es.search(index="data2", body=search_body)
+                    hits = resp.get("hits", {}).get("hits", []) or []
+                    sorted_links = [hit.get("_source", {}).get("link", "") for hit in hits]
+                except Exception as e:
+                    logger.error(f"ES文本搜索失败: {e}")
+                    sorted_links = []
+                    
+            elif search_mode == "llm_only":
+                # 方案3: 纯LLM判断（直接从ES获取候选，用LLM判断，不进行向量检索）
+                sorted_links = llm_search_direct_from_es(query, top_k=30)
+                
+            elif search_mode == "vector_with_llm_always":
+                # 方案4: 始终使用LLM重排序向量结果（不判断前10是否有hit）
                 pre_vec = precomputed_map.get(str(query))
-                results = vector_search(query, top_k=30, query_vector=pre_vec)  # 增加top_k到30，给LLM更多候选
-                sorted_links = generate_prompt_and_sort_with_description(query, results)
+                results = vector_search(query, top_k=30, query_vector=pre_vec)  # 获取30个候选
+                sorted_links = generate_prompt_and_sort_with_description(query, results, use_vector_results=True)
+                
+            else:  # vector_with_llm (智能混合模式)
+                # 方案5: 向量检索 + LLM（智能混合模式）
+                pre_vec = precomputed_map.get(str(query))
+                results = vector_search(query, top_k=10, query_vector=pre_vec)  # 先获取前10个结果
+                
+                # 检查前10个结果中是否有正确链接
+                top10_links = [r.get("link", "") for r in results[:10]]
+                correct_link_cleaned = clean_link(str(correct_link))
+                correct_link_normalized = normalize_url(correct_link_cleaned)
+                
+                has_hit_in_top10 = False
+                for link in top10_links:
+                    link_cleaned = clean_link(str(link))
+                    link_normalized = normalize_url(link_cleaned)
+                    if (correct_link_normalized == link_normalized or
+                        correct_link_cleaned == link_cleaned or
+                        correct_link_cleaned in link_cleaned or
+                        link_cleaned in correct_link_cleaned):
+                        has_hit_in_top10 = True
+                        break
+                
+                if has_hit_in_top10:
+                    # 前10有hit，使用向量检索结果进行LLM重排序
+                    logger.info(f"[{search_mode}] 查询 '{query}' 前10有hit，使用向量检索结果进行LLM重排序")
+                    sorted_links = generate_prompt_and_sort_with_description(query, results, use_vector_results=True)
+                else:
+                    # 前10没有hit，直接从ES获取候选，用LLM判断（不参考向量检索结果）
+                    logger.info(f"[{search_mode}] 查询 '{query}' 前10无hit，直接从ES获取候选，用LLM判断")
+                    sorted_links = llm_search_direct_from_es(query, top_k=30)
 
             rank = None
 
@@ -875,9 +1069,9 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
         "detailed_results": detailed_results
     }
 
-    # 保存报告到文件
-    with open(f'evaluation_report_{search_mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w',
-              encoding='utf-8') as f:
+    # 保存报告到文件（保存到 trainlog 文件夹）
+    report_filename = os.path.join(trainlog_dir, f'evaluation_report_{search_mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    with open(report_filename, 'w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     logger.info(f"[{search_mode}] 完整评估报告已保存到文件")
@@ -887,7 +1081,13 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
 
 def evaluate_all_modes(queries, correct_links):
     """评估所有检索模式"""
-    modes = ["vector_only", "vector_with_llm"]
+    modes = [
+        "vector_only",           # 方案1: 纯向量检索
+        "es_text_only",          # 方案2: 纯ES文本搜索
+        "llm_only",              # 方案3: 纯LLM判断
+        "vector_with_llm_always", # 方案4: 始终使用LLM重排序向量结果
+        "vector_with_llm"        # 方案5: 向量检索+LLM（智能混合模式）
+    ]
     results = {}
 
     for mode in modes:
@@ -919,8 +1119,11 @@ def evaluate_all_modes(queries, correct_links):
     for mode in modes:
         metrics = results[mode]
         mode_display = {
-            "vector_only": "向量检索(无LLM)",
-            "vector_with_llm": "向量检索+LLM(使用描述)"
+            "vector_only": "方案1: 纯向量检索",
+            "es_text_only": "方案2: 纯ES文本搜索",
+            "llm_only": "方案3: 纯LLM判断",
+            "vector_with_llm_always": "方案4: 向量+LLM(始终)",
+            "vector_with_llm": "方案5: 向量+LLM(智能)"
         }.get(mode, mode)
         print(
             f"{mode_display:<20} {metrics['mrr']:<10.4f} {metrics['hit@1']:<10.4f} {metrics['hit@5']:<10.4f} {metrics['hit@10']:<10.4f}")
@@ -931,7 +1134,9 @@ def evaluate_all_modes(queries, correct_links):
         "summary": results
     }
 
-    with open(f'evaluation_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w', encoding='utf-8') as f:
+    # 保存汇总报告到 trainlog 文件夹
+    summary_filename = os.path.join(trainlog_dir, f'evaluation_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    with open(summary_filename, 'w', encoding='utf-8') as f:
         json.dump(summary_report, f, ensure_ascii=False, indent=2)
 
     logger.info("所有检索模式评测完成，汇总报告已保存")
@@ -947,6 +1152,13 @@ def main():
     if not os.path.exists(file_path):
         print(f"未找到评测文件: {file_path}")
         print("运行简单测试模式...\n")
+        print("支持的检索方案：")
+        print("  1. vector_only - 纯向量检索")
+        print("  2. es_text_only - 纯ES文本搜索")
+        print("  3. llm_only - 纯LLM判断")
+        print("  4. vector_with_llm_always - 向量+LLM（始终重排序）")
+        print("  5. vector_with_llm - 向量+LLM（智能混合模式，推荐）")
+        print("\n详细说明请参考：检索方案对比说明.md\n")
 
         # 测试查询列表
         test_queries = ["AK47", "F-16战斗机", "步枪"]
@@ -962,17 +1174,28 @@ def main():
         print(f"读取了 {len(queries)} 个查询")
 
         # 检查是否有指定评测模式的命令行参数
-        if len(sys.argv) > 1 and sys.argv[1] in ["--vector-only", "--vector-with-llm"]:
+        mode_map = {
+            "--vector-only": "vector_only",
+            "--es-text-only": "es_text_only",
+            "--llm-only": "llm_only",
+            "--vector-llm-always": "vector_with_llm_always",
+            "--vector-llm": "vector_with_llm"
+        }
+        
+        if len(sys.argv) > 1 and sys.argv[1] in mode_map:
             # 显式指定单一模式
-            arg = sys.argv[1]
-            if arg == "--vector-only":
-                mode = "vector_only"
-            else:
-                mode = "vector_with_llm"
+            mode = mode_map[sys.argv[1]]
+            mode_names = {
+                "vector_only": "方案1: 纯向量检索",
+                "es_text_only": "方案2: 纯ES文本搜索",
+                "llm_only": "方案3: 纯LLM判断",
+                "vector_with_llm_always": "方案4: 向量+LLM（始终重排序）",
+                "vector_with_llm": "方案5: 向量+LLM（智能混合模式）"
+            }
             logger.info(f"开始评测 {mode} 检索模式，共 {len(queries)} 个查询")
-            print(f"开始评测 {mode} 检索模式...")
+            print(f"开始评测 {mode_names.get(mode, mode)}...")
             mrr, hit_at_1, hit_at_5, hit_at_10 = calculate_metrics(queries, correct_links, mode)
-            print(f"\n{mode} 检索模式评测结果:")
+            print(f"\n{mode_names.get(mode, mode)} 评测结果:")
             print(f"{'=' * 50}")
             print(f"MRR: {mrr:.4f}")
             print(f"Hit@1: {hit_at_1:.4f}")
@@ -980,6 +1203,16 @@ def main():
             print(f"Hit@10: {hit_at_10:.4f}")
         else:
             # 默认或 --all：依次评测所有模式并输出汇总
+            print("\n" + "=" * 70)
+            print("开始评估所有5种检索方案")
+            print("=" * 70)
+            print("方案列表：")
+            print("  1. vector_only - 纯向量检索")
+            print("  2. es_text_only - 纯ES文本搜索")
+            print("  3. llm_only - 纯LLM判断")
+            print("  4. vector_with_llm_always - 向量+LLM（始终重排序）")
+            print("  5. vector_with_llm - 向量+LLM（智能混合模式，推荐）")
+            print("\n详细说明请参考：检索方案对比说明.md\n")
             evaluate_all_modes(queries, correct_links)
     except Exception as e:
         print(f"评测失败: {e}")
@@ -996,5 +1229,22 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("\n\n用户中断执行")
+    except Exception as e:
+        logger.error(f"\n执行异常: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 恢复stdout和stderr，并关闭文件
+        if 'tee' in globals():
+            original_stdout = tee.stdout
+            original_stderr = tee.stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            tee.close()
+            print(f"\n✅ 控制台输出已保存到: {console_log_file}")
+            print(f"✅ 日志信息已保存到: {log_filename}")
 
