@@ -103,8 +103,8 @@ def extract_entity_words_from_text(text, lang='zh'):
         entity_words: 实体词列表
         entity_freq: 实体词频字典（每个实体出现1次）
     """
-    if not text or not isinstance(text, str) or len(text.strip()) < 5:
-        return [], {}
+    if not text or not isinstance(text, str) or len(text.strip()) < 2:
+        return [], {}  # 降低最小长度要求，允许短文本也提取实体
     
     try:
         # 使用NER模型提取实体词
@@ -247,7 +247,7 @@ def process_file(file_path, vectorize=True, batch_size=32):
                 
                 # 处理中文描述
                 zh_description = data.get("zh_description") or data.get("descriptions_zh", "")
-                if zh_description and len(zh_description.strip()) >= 10:
+                if zh_description and len(zh_description.strip()) >= 2:  # 降低最小长度要求，允许短文本也提取实体
                     entity_words_zh, entity_freq_zh = extract_entity_words_from_text(
                         zh_description, lang='zh'
                     )
@@ -283,7 +283,7 @@ def process_file(file_path, vectorize=True, batch_size=32):
                 
                 # 处理英文描述
                 en_description = data.get("en_description") or data.get("descriptions_en", "")
-                if en_description and len(en_description.strip()) >= 10:
+                if en_description and len(en_description.strip()) >= 2:  # 降低最小长度要求，允许短文本也提取实体
                     entity_words_en, entity_freq_en = extract_entity_words_from_text(
                         en_description, lang='en'
                     )

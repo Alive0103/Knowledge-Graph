@@ -39,25 +39,52 @@ def load_vector_model(model_path=None, use_finetuned=True):
     if model_path is None:
         # 获取脚本所在目录（work_wyy），然后构建模型路径
         # 尝试多种方式找到work_wyy目录
-        script_dir = None
         current_file = os.path.abspath(__file__)
-
-        # 方法1: 如果vector_model.py在work_wyy目录下
-        if 'work_wyy' in current_file:
+        work_wyy_dir = None
+        
+        # 方法1: 如果vector_model.py在work_wyy目录下，直接使用
+        if os.path.basename(os.path.dirname(current_file)) == 'work_wyy':
+            work_wyy_dir = os.path.dirname(current_file)
+        # 方法2: 查找路径中的work_wyy目录
+        elif 'work_wyy' in current_file:
             work_wyy_idx = current_file.find('work_wyy')
-            script_dir = current_file[:current_file.find('work_wyy') + len('work_wyy')]
+            work_wyy_dir = current_file[:work_wyy_idx + len('work_wyy')]
+        # 方法3: 从当前文件向上查找work_wyy目录
         else:
-            # 方法2: 假设当前文件在work_wyy目录下
-            script_dir = os.path.dirname(current_file)
-
-        # 优先使用微调后的模型（如果存在）
-        finetuned_path = os.path.join(script_dir, 'model', 'ner_finetuned')
-        base_path = os.path.join(script_dir, 'model', 'chinese-roberta-wwm-ext-large')
-
+            search_dir = os.path.dirname(current_file)
+            max_depth = 5  # 最多向上查找5层
+            for _ in range(max_depth):
+                if os.path.basename(search_dir) == 'work_wyy':
+                    work_wyy_dir = search_dir
+                    break
+                parent = os.path.dirname(search_dir)
+                if parent == search_dir:  # 到达根目录
+                    break
+                search_dir = parent
+        
+        # 如果还是找不到，尝试使用当前工作目录
+        if work_wyy_dir is None:
+            cwd = os.getcwd()
+            if os.path.basename(cwd) == 'work_wyy':
+                work_wyy_dir = cwd
+            elif 'work_wyy' in cwd:
+                work_wyy_idx = cwd.find('work_wyy')
+                work_wyy_dir = cwd[:work_wyy_idx + len('work_wyy')]
+        
+        # 如果还是找不到，使用当前文件所在目录（假设在work_wyy下）
+        if work_wyy_dir is None:
+            work_wyy_dir = os.path.dirname(current_file)
+            logger.warning(f"⚠️  无法确定work_wyy目录，使用当前文件目录: {work_wyy_dir}")
+        
+        # 构建模型路径
+        finetuned_path = os.path.join(work_wyy_dir, 'model', 'ner_finetuned')
+        base_path = os.path.join(work_wyy_dir, 'model', 'chinese-roberta-wwm-ext-large')
+        
         # 转换为绝对路径
         finetuned_path = os.path.abspath(finetuned_path)
         base_path = os.path.abspath(base_path)
-
+        
+        # 尝试查找模型
         if use_finetuned and os.path.exists(finetuned_path):
             model_path = finetuned_path
             logger.info(f"✅ 使用微调后的模型: {model_path}")
@@ -68,21 +95,37 @@ def load_vector_model(model_path=None, use_finetuned=True):
             # 如果都找不到，尝试相对路径（兼容旧代码）
             finetuned_path_rel = './model/ner_finetuned'
             base_path_rel = './model/chinese-roberta-wwm-ext-large'
-            if use_finetuned and os.path.exists(finetuned_path_rel):
-                model_path = os.path.abspath(finetuned_path_rel)
-                logger.info(f"✅ 使用微调后的模型（相对路径）: {model_path}")
-            elif os.path.exists(base_path_rel):
-                model_path = os.path.abspath(base_path_rel)
-                logger.info(f"⚠️  使用基础模型（相对路径）: {model_path}")
-            else:
-                raise FileNotFoundError(
-                    f"无法找到模型！尝试的路径：\n"
-                    f"  微调模型: {finetuned_path}\n"
-                    f"  基础模型: {base_path}\n"
-                    f"  相对路径微调: {finetuned_path_rel}\n"
-                    f"  相对路径基础: {base_path_rel}\n"
-                    f"当前工作目录: {os.getcwd()}"
-                )
+            # 也尝试从work_wyy目录的相对路径
+            if work_wyy_dir:
+                finetuned_path_rel2 = os.path.join(work_wyy_dir, 'model', 'ner_finetuned')
+                base_path_rel2 = os.path.join(work_wyy_dir, 'model', 'chinese-roberta-wwm-ext-large')
+                if use_finetuned and os.path.exists(finetuned_path_rel2):
+                    model_path = os.path.abspath(finetuned_path_rel2)
+                    logger.info(f"✅ 使用微调后的模型: {model_path}")
+                elif os.path.exists(base_path_rel2):
+                    model_path = os.path.abspath(base_path_rel2)
+                    logger.info(f"⚠️  使用基础模型: {model_path}")
+            
+            if model_path is None:
+                # 最后尝试相对路径
+                if use_finetuned and os.path.exists(finetuned_path_rel):
+                    model_path = os.path.abspath(finetuned_path_rel)
+                    logger.info(f"✅ 使用微调后的模型（相对路径）: {model_path}")
+                elif os.path.exists(base_path_rel):
+                    model_path = os.path.abspath(base_path_rel)
+                    logger.info(f"⚠️  使用基础模型（相对路径）: {model_path}")
+                else:
+                    raise FileNotFoundError(
+                        f"❌ 无法找到模型！\n"
+                        f"尝试的路径：\n"
+                        f"  微调模型: {finetuned_path}\n"
+                        f"  基础模型: {base_path}\n"
+                        f"  相对路径微调: {finetuned_path_rel}\n"
+                        f"  相对路径基础: {base_path_rel}\n"
+                        f"当前工作目录: {os.getcwd()}\n"
+                        f"vector_model.py位置: {current_file}\n"
+                        f"推断的work_wyy目录: {work_wyy_dir}"
+                    )
     
     _model_path = model_path
     

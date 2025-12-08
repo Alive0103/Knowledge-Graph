@@ -96,7 +96,7 @@ INDEX_NAME = "data2"
 
 
 def create_vector_index():
-    """创建包含向量字段的索引映射 - 包含标签、描述、高频词向量"""
+    """创建包含向量字段的索引映射 - 包含标签、描述、实体词向量"""
     index_mapping = {
         "mappings": {
             "properties": {
@@ -128,15 +128,15 @@ def create_vector_index():
                     "index": True,
                     "similarity": "cosine"
                 },
-                # 中文高频词向量
-                "high_freq_words_zh_vector": {
+                # 中文实体词向量
+                "entity_words_zh_vector": {
                     "type": "dense_vector",
                     "dims": VECTOR_DIMS,
                     "index": True,
                     "similarity": "cosine"
                 },
-                # 英文高频词向量
-                "high_freq_words_en_vector": {
+                # 英文实体词向量
+                "entity_words_en_vector": {
                     "type": "dense_vector",
                     "dims": VECTOR_DIMS,
                     "index": True,
@@ -335,7 +335,10 @@ def generate_vectors_batch(texts, batch_size=32):
 
 
 def process_single_item(item, use_batch=False, vector_cache=None):
-    """处理单条数据项 - 生成标签、描述、高频词的向量
+    """处理单条数据项 - 生成标签、描述、实体词的向量
+    
+    注意：ES中存储的字段名与源文件一致：entity_words_zh_vector 和 entity_words_en_vector
+    这些字段存储的是NER提取的实体词向量。
     
     Args:
         item: 数据项
@@ -370,9 +373,9 @@ def process_single_item(item, use_batch=False, vector_cache=None):
     entity_words_zh = item.get("_entity_words_zh", item.get("_high_freq_words_zh", []))
     entity_words_en = item.get("_entity_words_en", item.get("_high_freq_words_en", []))
     
-    # 兼容旧字段名（用于ES字段名）
-    high_freq_words_zh = entity_words_zh
-    high_freq_words_en = entity_words_en
+    # 使用实体词列表（变量名保持简洁）
+    entity_words_zh_list = entity_words_zh
+    entity_words_en_list = entity_words_en
     
     # 优先使用 find_top_k.py 预生成的实体词向量（如果存在）
     entity_words_zh_vector = item.get("_entity_words_zh_vector")
@@ -444,13 +447,13 @@ def process_single_item(item, use_batch=False, vector_cache=None):
         else:
             logger.warning(f"英文描述向量生成失败，标签: {label[:30]}")
     
-    # 4. 为中文实体词生成向量（使用NER提取的实体词，而不是高频词）
+    # 4. 为中文实体词生成向量（使用NER提取的实体词）
     # 优先使用 find_top_k.py 预生成的向量（如果存在）
     if entity_words_zh_vector and isinstance(entity_words_zh_vector, list) and len(entity_words_zh_vector) == VECTOR_DIMS:
         # 直接使用预生成的向量（已使用微调后的模型向量化并合并）
-        new_data["high_freq_words_zh_vector"] = [float(x) for x in entity_words_zh_vector]
-        logger.debug(f"使用预生成的中文实体词向量，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh) if high_freq_words_zh else 0}")
-    elif high_freq_words_zh and isinstance(high_freq_words_zh, list) and len(high_freq_words_zh) > 0:
+        new_data["entity_words_zh_vector"] = [float(x) for x in entity_words_zh_vector]
+        logger.debug(f"使用预生成的中文实体词向量，标签: {label[:30]}, 实体词数: {len(entity_words_zh_list) if entity_words_zh_list else 0}")
+    elif entity_words_zh_list and isinstance(entity_words_zh_list, list) and len(entity_words_zh_list) > 0:
         # 如果没有预生成的向量，则重新向量化（使用微调后的模型）
         # 方法：对每个实体词单独向量化，然后合并（与 find_top_k.py 保持一致）
         try:
@@ -459,7 +462,7 @@ def process_single_item(item, use_batch=False, vector_cache=None):
             
             # 批量生成每个实体词的向量（使用微调后的模型）
             entity_vectors = batch_generate_vectors(
-                high_freq_words_zh,
+                entity_words_zh_list,
                 use_finetuned=True,
                 target_dim=VECTOR_DIMS,
                 batch_size=32
@@ -477,28 +480,28 @@ def process_single_item(item, use_batch=False, vector_cache=None):
                 norm = np.linalg.norm(merged_vector)
                 if norm > 0:
                     merged_vector = merged_vector / norm
-                    new_data["high_freq_words_zh_vector"] = [float(x) for x in merged_vector.tolist()]
+                    new_data["entity_words_zh_vector"] = [float(x) for x in merged_vector.tolist()]
                 else:
                     logger.warning(f"中文实体词向量合并后归一化失败，标签: {label[:30]}")
             else:
-                logger.warning(f"中文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh)}")
+                logger.warning(f"中文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(entity_words_zh_list)}")
         except Exception as e:
             # 回退到原始方法（将所有实体词用空格连接，然后向量化）
             logger.warning(f"批量向量化失败，使用回退方法: {e}")
-            zh_freq_text = " ".join(high_freq_words_zh)
+            zh_freq_text = " ".join(entity_words_zh_list)
             zh_freq_vector = generate_vector(zh_freq_text)
             if zh_freq_vector and len(zh_freq_vector) == VECTOR_DIMS:
-                new_data["high_freq_words_zh_vector"] = zh_freq_vector
+                new_data["entity_words_zh_vector"] = zh_freq_vector
             else:
-                logger.warning(f"中文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_zh)}")
+                logger.warning(f"中文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(entity_words_zh_list)}")
     
-    # 5. 为英文实体词生成向量（使用NER提取的实体词，而不是高频词）
+    # 5. 为英文实体词生成向量（使用NER提取的实体词）
     # 优先使用 find_top_k.py 预生成的向量（如果存在）
     if entity_words_en_vector and isinstance(entity_words_en_vector, list) and len(entity_words_en_vector) == VECTOR_DIMS:
         # 直接使用预生成的向量（已使用微调后的模型向量化并合并）
-        new_data["high_freq_words_en_vector"] = [float(x) for x in entity_words_en_vector]
-        logger.debug(f"使用预生成的英文实体词向量，标签: {label[:30]}, 实体词数: {len(high_freq_words_en) if high_freq_words_en else 0}")
-    elif high_freq_words_en and isinstance(high_freq_words_en, list) and len(high_freq_words_en) > 0:
+        new_data["entity_words_en_vector"] = [float(x) for x in entity_words_en_vector]
+        logger.debug(f"使用预生成的英文实体词向量，标签: {label[:30]}, 实体词数: {len(entity_words_en_list) if entity_words_en_list else 0}")
+    elif entity_words_en_list and isinstance(entity_words_en_list, list) and len(entity_words_en_list) > 0:
         # 如果没有预生成的向量，则重新向量化（使用微调后的模型）
         try:
             from vector_model import batch_generate_vectors
@@ -506,7 +509,7 @@ def process_single_item(item, use_batch=False, vector_cache=None):
             
             # 批量生成每个实体词的向量（使用微调后的模型）
             entity_vectors = batch_generate_vectors(
-                high_freq_words_en,
+                entity_words_en_list,
                 use_finetuned=True,
                 target_dim=VECTOR_DIMS,
                 batch_size=32
@@ -524,20 +527,20 @@ def process_single_item(item, use_batch=False, vector_cache=None):
                 norm = np.linalg.norm(merged_vector)
                 if norm > 0:
                     merged_vector = merged_vector / norm
-                    new_data["high_freq_words_en_vector"] = [float(x) for x in merged_vector.tolist()]
+                    new_data["entity_words_en_vector"] = [float(x) for x in merged_vector.tolist()]
                 else:
                     logger.warning(f"英文实体词向量合并后归一化失败，标签: {label[:30]}")
             else:
-                logger.warning(f"英文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_en)}")
+                logger.warning(f"英文实体词向量化失败，标签: {label[:30]}, 实体词数: {len(entity_words_en_list)}")
         except Exception as e:
             # 回退到原始方法（将所有实体词用空格连接，然后向量化）
             logger.warning(f"批量向量化失败，使用回退方法: {e}")
-            en_freq_text = " ".join(high_freq_words_en)
+            en_freq_text = " ".join(entity_words_en_list)
             en_freq_vector = generate_vector(en_freq_text)
             if en_freq_vector and len(en_freq_vector) == VECTOR_DIMS:
-                new_data["high_freq_words_en_vector"] = en_freq_vector
+                new_data["entity_words_en_vector"] = en_freq_vector
             else:
-                logger.warning(f"英文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(high_freq_words_en)}")
+                logger.warning(f"英文实体词向量生成失败，标签: {label[:30]}, 实体词数: {len(entity_words_en_list)}")
 
     return new_data
 
@@ -613,8 +616,8 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
         'label_en': 0,
         'descriptions_zh': 0,
         'descriptions_en': 0,
-        'high_freq_words_zh': 0,
-        'high_freq_words_en': 0
+        'entity_words_zh': 0,
+        'entity_words_en': 0
     }
     start_time = time.time()
     last_speed_time = start_time
@@ -658,10 +661,10 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
                     vector_stats['descriptions_zh'] += 1
                 if 'descriptions_en_vector' in transformed_data:
                     vector_stats['descriptions_en'] += 1
-                if 'high_freq_words_zh_vector' in transformed_data:
-                    vector_stats['high_freq_words_zh'] += 1
-                if 'high_freq_words_en_vector' in transformed_data:
-                    vector_stats['high_freq_words_en'] += 1
+                if 'entity_words_zh_vector' in transformed_data:
+                    vector_stats['entity_words_zh'] += 1
+                if 'entity_words_en_vector' in transformed_data:
+                    vector_stats['entity_words_en'] += 1
 
                 # 在开始处理时显示信息
                 if line_num == 1:
@@ -677,12 +680,14 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
                     print(f"  英文标签向量(含所有别名): {'✓' if 'label_en_vector' in transformed_data else '✗'}")
                     print(f"  中文描述向量: {'✓' if 'descriptions_zh_vector' in transformed_data else '✗'}")
                     print(f"  英文描述向量: {'✓' if 'descriptions_en_vector' in transformed_data else '✗'}")
-                    high_freq_zh = transformed_data.get('_high_freq_words_zh', [])
-                    high_freq_en = transformed_data.get('_high_freq_words_en', [])
-                    print(f"  中文高频词数: {len(high_freq_zh) if isinstance(high_freq_zh, list) else 0}")
-                    print(f"  英文高频词数: {len(high_freq_en) if isinstance(high_freq_en, list) else 0}")
-                    print(f"  中文高频词向量(所有高频词): {'✓' if 'high_freq_words_zh_vector' in transformed_data else '✗'}")
-                    print(f"  英文高频词向量(所有高频词): {'✓' if 'high_freq_words_en_vector' in transformed_data else '✗'}")
+                    # 注意：实体词列表不会存入ES，只存储向量，所以从原始数据读取用于显示
+                    entity_words_zh = data.get('_entity_words_zh', data.get('_high_freq_words_zh', []))
+                    entity_words_en = data.get('_entity_words_en', data.get('_high_freq_words_en', []))
+                    print(f"  中文实体词数: {len(entity_words_zh) if isinstance(entity_words_zh, list) else 0}")
+                    print(f"  英文实体词数: {len(entity_words_en) if isinstance(entity_words_en, list) else 0}")
+                    # ES中存储的字段名与源文件一致：entity_words_*_vector
+                    print(f"  中文实体词向量(ES字段: entity_words_zh_vector): {'✓' if 'entity_words_zh_vector' in transformed_data else '✗'}")
+                    print(f"  英文实体词向量(ES字段: entity_words_en_vector): {'✓' if 'entity_words_en_vector' in transformed_data else '✗'}")
                     print()
 
                 actions.append({
@@ -793,8 +798,8 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
     print(f"  英文标签向量(label+所有英文别名): {vector_stats['label_en']}个")
     print(f"  中文描述向量: {vector_stats['descriptions_zh']}个")
     print(f"  英文描述向量: {vector_stats['descriptions_en']}个")
-    print(f"  中文高频词向量(所有高频词): {vector_stats['high_freq_words_zh']}个")
-    print(f"  英文高频词向量(所有高频词): {vector_stats['high_freq_words_en']}个")
+    print(f"  中文实体词向量: {vector_stats['entity_words_zh']}个")
+    print(f"  英文实体词向量: {vector_stats['entity_words_en']}个")
     print(f"  向量总数: {total_vectors}个")
     
     if total_imported > 0:
@@ -804,8 +809,8 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
         print(f"  英文标签(label+所有别名): {vector_stats['label_en']/total_imported*100:.1f}%")
         print(f"  中文描述: {vector_stats['descriptions_zh']/total_imported*100:.1f}%")
         print(f"  英文描述: {vector_stats['descriptions_en']/total_imported*100:.1f}%")
-        print(f"  中文高频词(所有高频词): {vector_stats['high_freq_words_zh']/total_imported*100:.1f}%")
-        print(f"  英文高频词(所有高频词): {vector_stats['high_freq_words_en']/total_imported*100:.1f}%")
+        print(f"  中文实体词向量: {vector_stats['entity_words_zh']/total_imported*100:.1f}%")
+        print(f"  英文实体词向量: {vector_stats['entity_words_en']/total_imported*100:.1f}%")
 
     # 显示设备使用情况
     print(f"\n设备信息:")
@@ -831,8 +836,8 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
             'label_en_vector',
             'descriptions_zh_vector',
             'descriptions_en_vector',
-            'high_freq_words_zh_vector',
-            'high_freq_words_en_vector'
+            'entity_words_zh_vector',
+            'entity_words_en_vector'
         ]
         
         field_stats = {}
@@ -927,10 +932,10 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
                     vector_status_parts.append('✓中文描述')
                 if doc_vectors.get('descriptions_en_vector'): 
                     vector_status_parts.append('✓英文描述')
-                if doc_vectors.get('high_freq_words_zh_vector'): 
-                    vector_status_parts.append('✓中文高频词')
-                if doc_vectors.get('high_freq_words_en_vector'): 
-                    vector_status_parts.append('✓英文高频词')
+                if doc_vectors.get('entity_words_zh_vector'): 
+                    vector_status_parts.append('✓中文实体词')
+                if doc_vectors.get('entity_words_en_vector'): 
+                    vector_status_parts.append('✓英文实体词')
                 
                 # 显示缺失的字段
                 missing_parts = []
@@ -944,10 +949,10 @@ def process_and_import_to_es(input_path, batch_size=20, request_timeout=120, vec
                     missing_parts.append('✗中文描述')
                 if not doc_vectors.get('descriptions_en_vector'): 
                     missing_parts.append('✗英文描述')
-                if not doc_vectors.get('high_freq_words_zh_vector'): 
-                    missing_parts.append('✗中文高频词')
-                if not doc_vectors.get('high_freq_words_en_vector'): 
-                    missing_parts.append('✗英文高频词')
+                if not doc_vectors.get('entity_words_zh_vector'): 
+                    missing_parts.append('✗中文实体词')
+                if not doc_vectors.get('entity_words_en_vector'): 
+                    missing_parts.append('✗英文实体词')
                 
                 # 显示结果
                 if vector_status_parts:

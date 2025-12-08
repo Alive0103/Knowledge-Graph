@@ -296,6 +296,83 @@ def load_bio_format(file_path):
     return examples, entity_types_set
 
 
+def load_train_txt_format(file_path):
+    """加载train.txt格式的数据（JSONL格式，每行一个JSON对象）"""
+    examples = []
+    entity_types_set = set()
+    
+    if not os.path.exists(file_path):
+        logger.warning(f"文件不存在: {file_path}")
+        return examples, entity_types_set
+    
+    logger.info(f"加载train.txt格式数据: {file_path}")
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    data = json.loads(line)
+                    content = data.get('content', '')
+                    result_list = data.get('result_list', [])
+                    prompt = data.get('prompt', '')  # 实体类型提示（可选）
+                    
+                    if not content:
+                        continue
+                    
+                    labels = ['O'] * len(content)
+                    
+                    for entity in result_list:
+                        start = entity.get('start', -1)
+                        end = entity.get('end', -1)
+                        entity_text = entity.get('text', '')
+                        entity_type = entity.get('prompt', prompt)  # 优先使用实体自己的prompt，否则使用全局prompt
+                        
+                        if not entity_type:
+                            entity_type = 'ENTITY'  # 默认类型
+                        
+                        if entity_type:
+                            entity_types_set.add(entity_type)
+                        
+                        if start >= 0 and end > start and end <= len(content):
+                            # 验证实体文本是否匹配
+                            actual_text = content[start:end]
+                            if actual_text != entity_text:
+                                logger.debug(f"第{line_num}行：实体文本不匹配: 期望 '{entity_text}', 实际 '{actual_text}'")
+                            
+                            labels[start] = f'B-{entity_type}'
+                            for i in range(start + 1, end):
+                                if i < len(labels):
+                                    labels[i] = f'I-{entity_type}'
+                    
+                    examples.append({
+                        'text': content,
+                        'labels': labels
+                    })
+                    
+                except json.JSONDecodeError as e:
+                    logger.warning(f"第{line_num}行JSON解析失败: {e}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"第{line_num}行处理失败: {e}")
+                    continue
+        
+        if examples:
+            logger.info(f"成功加载 {len(examples)} 条数据，发现 {len(entity_types_set)} 种实体类型")
+            if entity_types_set:
+                logger.info(f"实体类型: {', '.join(sorted(entity_types_set))}")
+    
+    except Exception as e:
+        logger.error(f"加载文件 {file_path} 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    return examples, entity_types_set
+
+
 def load_ccks_bio_format(sentences_file, tags_file):
     """加载CCKS的BIO格式数据（sentences.txt + tags.txt分开存储）"""
     examples = []
@@ -441,17 +518,35 @@ def load_all_data_from_directories(base_dir):
         else:
             logger.warning("validate_data.json没有实体标注，跳过")
     
-    fold0_dir = os.path.join(ccks_dir, "data", "fold0", "train")
-    fold0_sentences = os.path.join(fold0_dir, "sentences.txt")
-    fold0_tags = os.path.join(fold0_dir, "tags.txt")
-    if os.path.exists(fold0_sentences) and os.path.exists(fold0_tags):
-        logger.info("从ccks_ner加载fold0训练数据（BIO格式）...")
-        examples, types = load_ccks_bio_format(fold0_sentences, fold0_tags)
+    # 加载所有fold的训练数据（fold0-4）
+    logger.info("=" * 50)
+    logger.info("从ccks_ner加载所有fold的训练数据（BIO格式）...")
+    fold_data_dir = os.path.join(ccks_dir, "data")
+    total_fold_examples = 0
+    for fold_idx in range(5):  # fold0 到 fold4
+        fold_dir = os.path.join(fold_data_dir, f"fold{fold_idx}", "train")
+        fold_sentences = os.path.join(fold_dir, "sentences.txt")
+        fold_tags = os.path.join(fold_dir, "tags.txt")
+        if os.path.exists(fold_sentences) and os.path.exists(fold_tags):
+            examples, types = load_ccks_bio_format(fold_sentences, fold_tags)
+            all_train_examples.extend(examples)
+            all_entity_types.update(types)
+            total_fold_examples += len(examples)
+            logger.info(f"  加载fold{fold_idx}训练数据: {len(examples)} 条")
+    logger.info(f"  所有fold训练数据总计: {total_fold_examples} 条")
+    
+    # 3. 从work_wyy/data/train.txt加载数据
+    train_txt_file = os.path.join(base_dir, "train.txt")
+    if os.path.exists(train_txt_file):
+        logger.info("=" * 50)
+        logger.info("从train.txt加载数据...")
+        examples, types = load_train_txt_format(train_txt_file)
         all_train_examples.extend(examples)
         all_entity_types.update(types)
+        logger.info(f"从train.txt加载了 {len(examples)} 条训练数据")
     
-    # 3. 从nlp_datasets目录加载MSRA数据（可选）
-    USE_MSRA_DATA = False
+    # 4. 从nlp_datasets目录加载MSRA数据（启用所有数据）
+    USE_MSRA_DATA = True  # 启用MSRA数据
     
     if USE_MSRA_DATA:
         msra_dir = os.path.join(base_dir, "nlp_datasets", "ner", "msra")
@@ -460,16 +555,18 @@ def load_all_data_from_directories(base_dir):
         
         if os.path.exists(msra_train_file):
             logger.info("=" * 50)
-            logger.warning("从nlp_datasets/ner/msra加载训练数据（通用NER，实体类型不匹配）...")
+            logger.info("从nlp_datasets/ner/msra加载训练数据（通用NER，实体类型：ORG、PER、LOC）...")
             examples, types = load_bio_format(msra_train_file)
             all_train_examples.extend(examples)
             all_entity_types.update(types)
+            logger.info(f"从MSRA训练集加载了 {len(examples)} 条数据")
         
         if os.path.exists(msra_test_file):
-            logger.warning("从nlp_datasets/ner/msra加载测试数据（通用NER，实体类型不匹配）...")
+            logger.info("从nlp_datasets/ner/msra加载测试数据（通用NER，实体类型：ORG、PER、LOC）...")
             examples, types = load_bio_format(msra_test_file)
             all_dev_examples.extend(examples)
             all_entity_types.update(types)
+            logger.info(f"从MSRA测试集加载了 {len(examples)} 条数据")
     else:
         logger.info("=" * 50)
         logger.info("MSRA数据已禁用（通用NER，实体类型与军事领域不匹配）")

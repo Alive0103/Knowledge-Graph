@@ -81,6 +81,11 @@ sys.stderr = tee
 logger.info(f"所有控制台输出将同时保存到: {console_log_file}")
 logger.info(f"日志信息保存到: {log_filename}")
 
+# 关闭ES和urllib3的HTTP请求日志（只显示错误）
+logging.getLogger('elasticsearch').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+
 # 使用统一的向量生成模块（支持微调后的模型）
 try:
     from vector_model import load_vector_model, generate_vector as _generate_vector_module, batch_generate_vectors
@@ -314,8 +319,8 @@ def vector_search(query_text, top_k=20, query_vector=None):
     vector_fields = [
         ("descriptions_zh_vector", "zh", "desc"),
         ("descriptions_en_vector", "en", "desc"),
-        ("high_freq_words_zh_vector", "zh", "high_freq"),
-        ("high_freq_words_en_vector", "en", "high_freq"),
+        ("entity_words_zh_vector", "zh", "entity"),  # 中文实体词向量
+        ("entity_words_en_vector", "en", "entity"),  # 英文实体词向量
         ("label_vector", "mixed", "label"),
         ("label_zh_vector", "zh", "label"),
         ("label_en_vector", "en", "label")

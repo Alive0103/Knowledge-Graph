@@ -18,16 +18,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 模型路径（使用相对路径）
-NER_MODEL_PATH = './../model/ner_finetuned'
-BASE_MODEL_PATH = './../model/chinese-roberta-wwm-ext-large'
+# 模型路径（使用绝对路径，基于脚本位置）
+# 获取脚本所在目录（ner/），然后构建模型路径
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_script_dir)  # work_wyy 目录
 
-# 验证基础模型路径
-if not os.path.exists(BASE_MODEL_PATH):
-    logger.warning(f"⚠️  基础模型路径不存在: {BASE_MODEL_PATH}")
-    logger.warning(f"   请确保模型位于: {BASE_MODEL_PATH}")
-else:
-    logger.info(f"✅ 基础模型路径正确: {BASE_MODEL_PATH}")
+# 优先使用微调后的模型
+NER_MODEL_PATH = os.path.join(_parent_dir, 'model', 'ner_finetuned')
+BASE_MODEL_PATH = os.path.join(_parent_dir, 'model', 'chinese-roberta-wwm-ext-large')
+
+# 转换为绝对路径
+NER_MODEL_PATH = os.path.abspath(NER_MODEL_PATH)
+BASE_MODEL_PATH = os.path.abspath(BASE_MODEL_PATH)
 
 MAX_LENGTH = 512
 
@@ -76,10 +78,14 @@ def load_ner_model(model_path=None):
     
     if model_path is None:
         model_path = NER_MODEL_PATH
+    else:
+        # 如果是相对路径，转换为绝对路径
+        if not os.path.isabs(model_path):
+            model_path = os.path.abspath(model_path)
     
     # 如果微调模型不存在，使用基础模型
     if not os.path.exists(model_path):
-        logger.warning(f"微调模型不存在: {model_path}，使用基础模型: {BASE_MODEL_PATH}")
+        logger.warning(f"⚠️  微调模型不存在: {model_path}，使用基础模型: {BASE_MODEL_PATH}")
         model_path = BASE_MODEL_PATH
     
     try:
@@ -87,14 +93,15 @@ def load_ner_model(model_path=None):
         if not os.path.exists(model_path):
             logger.error(f"❌ 模型路径不存在: {model_path}")
             logger.error(f"   请确保模型位于: {model_path}")
+            logger.error(f"   当前工作目录: {os.getcwd()}")
+            logger.error(f"   NER脚本位置: {os.path.abspath(__file__)}")
             return False
         
-        logger.info(f"加载NER模型: {model_path}")
-        logger.info(f"   模型路径验证: ✅ 存在")
+        logger.info(f"✅ 加载NER模型: {model_path}")
         ner_tokenizer = BertTokenizer.from_pretrained(model_path)
         
         # 如果是指定的微调模型路径，尝试加载微调后的模型和标签映射
-        if model_path == NER_MODEL_PATH and os.path.exists(model_path):
+        if os.path.abspath(model_path) == os.path.abspath(NER_MODEL_PATH) and os.path.exists(model_path):
             # 先加载标签映射
             load_label_mapping(model_path)
             try:
@@ -145,16 +152,16 @@ def _tokens_to_text(tokens):
     if not tokens:
         return ""
     
-    # 使用tokenizer的decode方法更准确地还原文本
-    # 但需要先转换回token ids
+    # 使用tokenizer的decode方法更准确地还原文本（特别是英文）
     try:
-        # 尝试直接拼接（适用于中文）
-        text = "".join(tokens)
-        # 如果包含英文，可能需要添加空格
-        # 简单处理：如果token之间没有标点，可能需要空格
-        # 但为了简单，先直接拼接
+        # 将tokens转换回token ids
+        token_ids = ner_tokenizer.convert_tokens_to_ids(tokens)
+        # 使用decode方法还原文本（会自动处理空格和特殊字符）
+        text = ner_tokenizer.decode(token_ids, skip_special_tokens=True)
         return text
-    except:
+    except Exception as e:
+        # 如果decode失败，回退到简单拼接（适用于纯中文）
+        logger.debug(f"Token decode失败，使用拼接方法: {e}")
         return "".join(tokens)
 
 
