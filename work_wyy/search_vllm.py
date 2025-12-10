@@ -21,6 +21,18 @@ import re
 from urllib.parse import unquote
 from es_client import es
 import logging
+# 尝试导入配置中的索引名称
+try:
+    import sys
+    import os
+    # 添加local目录到路径
+    local_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'local')
+    if local_dir not in sys.path:
+        sys.path.insert(0, local_dir)
+    from config import ES_INDEX_NAME
+except ImportError:
+    # 如果无法导入，使用默认值（向后兼容）
+    ES_INDEX_NAME = 'data'
 import pandas as pd
 from tqdm import tqdm
 import concurrent.futures
@@ -327,7 +339,7 @@ def vector_search(query_text, top_k=20, query_vector=None):
     ]
 
     # 同时对多个向量字段做检索，然后融合结果
-    index_names = ["data2"]  # 只使用data2索引
+    index_names = [ES_INDEX_NAME]  # 使用配置文件中的索引名称
     merged_hits = {}
 
     for index_name in index_names:
@@ -568,7 +580,7 @@ def llm_search_direct_from_es(query, top_k=30):
             "size": top_k
         }
         
-        resp = es.search(index="data2", body=search_body)
+        resp = es.search(index=ES_INDEX_NAME, body=search_body)
         hits = resp.get("hits", {}).get("hits", []) or []
         
         if not hits:
@@ -902,7 +914,7 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
                         },
                         "size": 30
                     }
-                    resp = es.search(index="data2", body=search_body)
+                    resp = es.search(index=ES_INDEX_NAME, body=search_body)
                     hits = resp.get("hits", {}).get("hits", []) or []
                     sorted_links = [hit.get("_source", {}).get("link", "") for hit in hits]
                 except Exception as e:

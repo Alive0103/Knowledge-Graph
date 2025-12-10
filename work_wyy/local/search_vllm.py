@@ -929,7 +929,7 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
                         },
                         "size": 30
                     }
-                    resp = es.search(index="data2", body=search_body)
+                    resp = es.search(index=ES_INDEX_NAME, body=search_body)
                     hits = resp.get("hits", {}).get("hits", []) or []
                     sorted_links = [hit.get("_source", {}).get("link", "") for hit in hits]
                 except Exception as e:
