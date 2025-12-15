@@ -922,7 +922,7 @@ def calculate_metrics(queries, correct_links, search_mode="vector_only"):
                         "query": {
                             "multi_match": {
                                 "query": query,
-                                "fields": ["label^3", "aliases_zh^2", "aliases_en^2", "descriptions_zh", "descriptions_en"],
+                                "fields": ["label^3", "aliases_zh^2", "aliases_en^2", "descriptions_zh", "descriptions_en", "wiki_content^2"],
                                 "type": "best_fields",
                                 "operator": "or"
                             }
