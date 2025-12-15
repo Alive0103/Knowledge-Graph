@@ -415,10 +415,27 @@ def vectorize_and_store_to_es(config_id=None):
         with open(config_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # 修改ES索引名称
-        old_index_pattern = r"ES_INDEX_NAME = '[^']+'"
-        new_index = f"ES_INDEX_NAME = 'data_{config_id}'"
-        content = re.sub(old_index_pattern, new_index, content)
+        # 修改ES索引名称（支持多种格式）
+        # 匹配: ES_INDEX_NAME = 'xxx' 或 ES_INDEX_NAME = "xxx" 或 ES_INDEX_NAME='xxx'
+        old_index_patterns = [
+            r"ES_INDEX_NAME\s*=\s*'[^']+'",
+            r'ES_INDEX_NAME\s*=\s*"[^"]+"',
+        ]
+        expected_index = f"data_{config_id}"
+        new_index = f"ES_INDEX_NAME = '{expected_index}'"
+        
+        # 尝试所有模式
+        replaced = False
+        for pattern in old_index_patterns:
+            if re.search(pattern, content):
+                content = re.sub(pattern, new_index, content)
+                replaced = True
+                break
+        
+        if not replaced:
+            logger.warning(f"⚠️  未找到ES_INDEX_NAME配置，将添加新配置")
+            # 在文件末尾添加
+            content += f"\n# 动态更新的ES索引名称\n{new_index}\n"
         
         # 修改模型路径
         old_pattern = r"FINETUNED_MODEL_PATH = os\.path\.join\(MODEL_DIR, '[^']+'\)"
@@ -726,17 +743,163 @@ def extract_ner_evaluation_metrics(output):
     return metrics
 
 
+def query_es_index_status(config_id):
+    """
+    查询ES索引状态并保存到JSON文件
+    
+    Args:
+        config_id: 配置ID
+    
+    Returns:
+        dict: 索引状态信息
+    """
+    from es_client import es
+    
+    index_name = f"data_{config_id}"
+    
+    status_info = {
+        "config_id": config_id,
+        "index_name": index_name,
+        "timestamp": datetime.now().isoformat(),
+        "exists": False,
+        "document_count": 0,
+        "index_settings": {},
+        "vector_fields_status": {},
+        "sample_documents": []
+    }
+    
+    try:
+        # 检查索引是否存在
+        if not es.indices.exists(index=index_name):
+            logger.warning(f"⚠️  索引 {index_name} 不存在")
+            return status_info
+        
+        status_info["exists"] = True
+        
+        # 获取文档总数
+        try:
+            count_result = es.count(index=index_name)
+            status_info["document_count"] = count_result.get("count", 0)
+        except Exception as e:
+            logger.warning(f"⚠️  获取文档总数失败: {e}")
+        
+        # 获取索引设置
+        try:
+            settings = es.indices.get_settings(index=index_name)
+            if index_name in settings:
+                status_info["index_settings"] = {
+                    "number_of_shards": settings[index_name].get("settings", {}).get("index", {}).get("number_of_shards"),
+                    "number_of_replicas": settings[index_name].get("settings", {}).get("index", {}).get("number_of_replicas"),
+                }
+        except Exception as e:
+            logger.warning(f"⚠️  获取索引设置失败: {e}")
+        
+        # 检查向量字段状态
+        # 字段名称到友好名称的映射
+        vector_fields_map = {
+            'label_vector': '标签向量(仅label)',
+            'label_zh_vector': '中文标签向量(label+所有中文别名)',
+            'label_en_vector': '英文标签向量(label+所有英文别名)',
+            'descriptions_zh_vector': '中文描述向量',
+            'descriptions_en_vector': '英文描述向量',
+            'entity_words_zh_vector': '中文实体词向量',
+            'entity_words_en_vector': '英文实体词向量'
+        }
+        
+        vector_fields = list(vector_fields_map.keys())
+        
+        for field in vector_fields:
+            try:
+                exists_query = {
+                    "query": {
+                        "exists": {
+                            "field": field
+                        }
+                    }
+                }
+                result = es.count(index=index_name, body=exists_query)
+                count = result.get('count', 0)
+                percentage = (count / status_info["document_count"] * 100) if status_info["document_count"] > 0 else 0
+                status_info["vector_fields_status"][field] = {
+                    "field_name": field,
+                    "display_name": vector_fields_map[field],
+                    "document_count": count,
+                    "percentage": round(percentage, 2)
+                }
+            except Exception as e:
+                logger.warning(f"⚠️  检查向量字段 {field} 失败: {e}")
+                status_info["vector_fields_status"][field] = {
+                    "field_name": field,
+                    "display_name": vector_fields_map[field],
+                    "document_count": 0,
+                    "percentage": 0.0,
+                    "error": str(e)
+                }
+        
+        # 添加向量生成率摘要（按用户友好的格式）
+        vector_generation_summary = {}
+        for field, field_info in status_info["vector_fields_status"].items():
+            display_name = field_info.get("display_name", field)
+            percentage = field_info.get("percentage", 0.0)
+            vector_generation_summary[display_name] = {
+                "percentage": percentage,
+                "document_count": field_info.get("document_count", 0),
+                "total_documents": status_info["document_count"]
+            }
+        
+        status_info["vector_generation_summary"] = vector_generation_summary
+        
+        # 获取样本文档（前3个）
+        try:
+            sample_query = {
+                "query": {"match_all": {}},
+                "size": 3,
+                "_source": ["label", "link", "aliases_zh", "aliases_en"]
+            }
+            sample_result = es.search(index=index_name, body=sample_query)
+            hits = sample_result.get("hits", {}).get("hits", [])
+            for hit in hits:
+                status_info["sample_documents"].append({
+                    "_id": hit.get("_id"),
+                    "_source": hit.get("_source", {})
+                })
+        except Exception as e:
+            logger.warning(f"⚠️  获取样本文档失败: {e}")
+        
+        logger.info(f"✅ ES索引状态查询完成: {index_name}")
+        logger.info(f"   文档总数: {status_info['document_count']}")
+        logger.info(f"   向量字段状态: {len([f for f, s in status_info['vector_fields_status'].items() if s.get('document_count', 0) > 0])} 个字段有数据")
+        
+    except Exception as e:
+        logger.error(f"❌ 查询ES索引状态失败: {e}")
+        status_info["error"] = str(e)
+    
+    return status_info
+
+
 def extract_search_evaluation_metrics(output):
     """从search_vllm.py的输出中提取评估指标"""
     metrics = {}
+    
+    # 模式名称到中文显示名称的映射
+    mode_to_display = {
+        'vector_only': '方案1: 纯向量检索',
+        'es_text_only': '方案2: 纯ES文本搜索',
+        'llm_only': '方案3: 纯LLM判断',
+        'vector_with_llm_always': '方案4: 向量+LLM(始终)',
+        'vector_with_llm': '方案5: 向量+LLM(智能)'
+    }
     
     # 提取所有检索模式的结果
     modes = ['vector_only', 'es_text_only', 'llm_only', 'vector_with_llm_always', 'vector_with_llm']
     
     for mode in modes:
-        # 查找该模式的MRR, Hit@1, Hit@5, Hit@10
-        pattern = rf"{mode}.*?MRR[：:]\s*([\d.]+).*?Hit@1[：:]\s*([\d.]+).*?Hit@5[：:]\s*([\d.]+).*?Hit@10[：:]\s*([\d.]+)"
-        match = re.search(pattern, output, re.DOTALL)
+        mode_found = False
+        
+        # 方法1: 从每个模式的详细输出中提取
+        # 格式: "{mode} 检索模式评测结果:\n...\nMRR: {mrr:.4f}\nHit@1: {hit@1:.4f}\nHit@5: {hit@5:.4f}\nHit@10: {hit@10:.4f}"
+        pattern1 = rf"{re.escape(mode)}\s+检索模式评测结果:.*?MRR[：:]\s*([\d.]+).*?Hit@1[：:]\s*([\d.]+).*?Hit@5[：:]\s*([\d.]+).*?Hit@10[：:]\s*([\d.]+)"
+        match = re.search(pattern1, output, re.DOTALL)
         if match:
             metrics[mode] = {
                 'mrr': float(match.group(1)),
@@ -744,16 +907,45 @@ def extract_search_evaluation_metrics(output):
                 'hit@5': float(match.group(3)),
                 'hit@10': float(match.group(4)),
             }
+            mode_found = True
         else:
-            # 尝试从汇总表格中提取
-            pattern = rf"方案\d+[：:].*?{mode}.*?([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
-            match = re.search(pattern, output)
-            if match:
+            # 方法2: 从汇总表格中提取
+            # 格式: "方案1: 纯向量检索    0.0530     0.0338     0.0631     0.0833"
+            display_name = mode_to_display.get(mode, '')
+            if display_name:
+                # 转义特殊字符
+                display_name_escaped = re.escape(display_name)
+                # 匹配: "方案X: 名称    数字    数字    数字    数字"
+                pattern2 = rf"{display_name_escaped}\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
+                match = re.search(pattern2, output)
+                if match:
+                    metrics[mode] = {
+                        'mrr': float(match.group(1)),
+                        'hit@1': float(match.group(2)),
+                        'hit@5': float(match.group(3)),
+                        'hit@10': float(match.group(4)),
+                    }
+                    mode_found = True
+        
+        # 如果还是没找到，尝试更宽松的模式（从汇总表格中按顺序提取）
+        if not mode_found:
+            # 汇总表格的格式是固定的顺序，按顺序提取
+            # 但这种方法不够可靠，因为如果某个模式失败，顺序会错乱
+            pass
+    
+    # 如果所有模式都没找到，尝试从JSON报告中提取
+    if not metrics:
+        # 查找JSON格式的报告
+        json_pattern = r'"search_mode"\s*:\s*"([^"]+)".*?"mrr"\s*:\s*([\d.]+).*?"hit@1"\s*:\s*([\d.]+).*?"hit@5"\s*:\s*([\d.]+).*?"hit@10"\s*:\s*([\d.]+)'
+        matches = re.finditer(json_pattern, output, re.DOTALL)
+        for match in matches:
+            mode = match.group(1)
+            if mode in modes:
                 metrics[mode] = {
-                    'mrr': float(match.group(1)),
-                    'hit@1': float(match.group(2)),
-                    'hit@5': float(match.group(3)),
-                    'hit@10': float(match.group(4)),
+                    'mrr': float(match.group(2)),
+                    'hit@1': float(match.group(3)),
+                    'hit@5': float(match.group(4)),
+                    'hit@10': float(match.group(5)),
                 }
     
     return metrics
@@ -860,36 +1052,102 @@ def run_final_test_with_config(config_id):
     new_path = f"FINETUNED_MODEL_PATH = os.path.join(MODEL_DIR, 'ner_finetuned_{config_id}')"
     content = re.sub(old_pattern, new_path, content)
     
-    # 修改ES索引名称
-    old_index_pattern = r"ES_INDEX_NAME = '[^']+'"
-    new_index = f"ES_INDEX_NAME = 'data_{config_id}'"
-    content = re.sub(old_index_pattern, new_index, content)
+    # 修改ES索引名称（支持多种格式）
+    # 匹配: ES_INDEX_NAME = 'xxx' 或 ES_INDEX_NAME = "xxx" 或 ES_INDEX_NAME='xxx'
+    old_index_patterns = [
+        r"ES_INDEX_NAME\s*=\s*'[^']+'",
+        r'ES_INDEX_NAME\s*=\s*"[^"]+"',
+    ]
+    expected_index = f"data_{config_id}"
+    new_index = f"ES_INDEX_NAME = '{expected_index}'"
+    
+    # 尝试所有模式
+    replaced = False
+    for pattern in old_index_patterns:
+        if re.search(pattern, content):
+            content = re.sub(pattern, new_index, content)
+            replaced = True
+            break
+    
+    if not replaced:
+        logger.warning(f"⚠️  未找到ES_INDEX_NAME配置，将添加新配置")
+        # 在文件末尾添加
+        content += f"\n# 动态更新的ES索引名称\n{new_index}\n"
     
     with open(config_path, 'w', encoding='utf-8') as f:
         f.write(content)
     
-    # 重新导入config
-    if 'config' in sys.modules:
-        import importlib
-        import config
-        importlib.reload(config)
+    # 验证config.py是否已正确修改
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_content = f.read()
+        if new_index not in config_content:
+            logger.error(f"❌ ES索引配置未正确更新！")
+            logger.error(f"   期望: {new_index}")
+            logger.error(f"   请检查config.py文件")
+            return False, {}, ""
     
-    logger.info(f"✅ 已切换到ES索引: data_{config_id}")
+    logger.info(f"✅ 已切换到ES索引: {expected_index}")
+    logger.info(f"✅ 已验证ES索引配置: {new_index}")
     
-    # 调用原始测试函数并捕获输出
+    # 调用原始测试函数
+    # 使用capture_output=False实时显示进度，输出会通过Tee对象写入日志文件
+    # 同时使用临时文件捕获输出用于提取指标
     test_script = os.path.join(script_dir, "search_vllm.py")
-    success, output = run_command(
-        [sys.executable, test_script],
-        cwd=work_dir,
-        description=f"运行最终测试（配置: {config_id}）",
-        capture_output=True
-    )
     
-    if success:
+    # 创建临时文件用于捕获输出
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_file:
+        tmp_output_file = tmp_file.name
+    
+    try:
+        # 使用Popen同时实时显示和捕获输出
+        env = os.environ.copy()
+        env['PYTHONUNBUFFERED'] = '1'
+        
+        process = subprocess.Popen(
+            [sys.executable, test_script],
+            cwd=work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            env=env,
+            bufsize=1
+        )
+        
+        # 实时读取并同时写入Tee对象和临时文件
+        with open(tmp_output_file, 'w', encoding='utf-8') as f:
+            for line in process.stdout:
+                # 写入Tee对象（会同时写入日志文件和控制台）
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                # 同时写入临时文件用于后续提取指标
+                f.write(line)
+                f.flush()
+        
+        # 等待进程完成
+        return_code = process.wait()
+        
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, [sys.executable, test_script])
+        
+        # 读取临时文件内容用于提取指标
+        with open(tmp_output_file, 'r', encoding='utf-8') as f:
+            output = f.read()
+        
         metrics = extract_search_evaluation_metrics(output)
         return True, metrics, output
-    else:
-        return False, {}, output
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ 运行最终测试失败（配置: {config_id}）")
+        return False, {}, ""
+    finally:
+        # 清理临时文件
+        if os.path.exists(tmp_output_file):
+            try:
+                os.unlink(tmp_output_file)
+            except:
+                pass
 
 
 def generate_comparison_table(all_results):
@@ -927,33 +1185,47 @@ def generate_comparison_table(all_results):
         
         logger.info(f"{row['config_name']:<20} {str(train_samples):<12} {str(dev_samples):<12} {str(entity_types):<12} {str(total_entities):<12} {successful:<12}")
     
-    # 打印检索系统评估结果表格
-    logger.info("\n【检索系统评估结果（MRR）】")
-    logger.info("-" * 100)
-    logger.info(f"{'配置名称':<20} {'纯向量':<12} {'ES文本':<12} {'纯LLM':<12} {'向量+LLM(始终)':<18} {'向量+LLM(智能)':<18}")
-    logger.info("-" * 100)
-    
-    for row in table_data:
-        search = row['search_metrics']
-        vector_only = search.get('vector_only', {}).get('mrr', 'N/A')
-        es_text = search.get('es_text_only', {}).get('mrr', 'N/A')
-        llm_only = search.get('llm_only', {}).get('mrr', 'N/A')
-        vector_llm_always = search.get('vector_with_llm_always', {}).get('mrr', 'N/A')
-        vector_llm = search.get('vector_with_llm', {}).get('mrr', 'N/A')
+    # 打印检索系统评估结果表格（如果存在）
+    has_search_metrics = any(row.get('search_metrics', {}) for row in table_data)
+    if has_search_metrics:
+        logger.info("\n【检索系统评估结果（MRR）】")
+        logger.info("-" * 100)
+        logger.info(f"{'配置名称':<20} {'纯向量':<12} {'ES文本':<12} {'纯LLM':<12} {'向量+LLM(始终)':<18} {'向量+LLM(智能)':<18}")
+        logger.info("-" * 100)
         
-        def format_metric(m):
-            if m == 'N/A':
-                return 'N/A'
-            return f"{m:.4f}"
-        
-        logger.info(f"{row['config_name']:<20} {format_metric(vector_only):<12} {format_metric(es_text):<12} {format_metric(llm_only):<12} {format_metric(vector_llm_always):<18} {format_metric(vector_llm):<18}")
+        for row in table_data:
+            search = row.get('search_metrics', {})
+            vector_only = search.get('vector_only', {}).get('mrr', 'N/A')
+            es_text = search.get('es_text_only', {}).get('mrr', 'N/A')
+            llm_only = search.get('llm_only', {}).get('mrr', 'N/A')
+            vector_llm_always = search.get('vector_with_llm_always', {}).get('mrr', 'N/A')
+            vector_llm = search.get('vector_with_llm', {}).get('mrr', 'N/A')
+            
+            def format_metric(m):
+                if m == 'N/A':
+                    return 'N/A'
+                return f"{m:.4f}"
+            
+            logger.info(f"{row['config_name']:<20} {format_metric(vector_only):<12} {format_metric(es_text):<12} {format_metric(llm_only):<12} {format_metric(vector_llm_always):<18} {format_metric(vector_llm):<18}")
+    else:
+        logger.info("\n【检索系统评估结果】")
+        logger.info("⚠️  检索系统评估结果未生成（已跳过最终测试，请手动测试）")
     
     # 保存详细结果到JSON文件
-    summary_file = os.path.join(trainlog_dir, f'dataset_comparison_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_file = os.path.join(trainlog_dir, f'dataset_comparison_summary_{timestamp}.json')
     with open(summary_file, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     
     logger.info(f"\n✅ 详细对比结果已保存到: {summary_file}")
+    
+    # 为每个配置单独保存结果到JSON文件
+    for config_id, result in all_results.items():
+        config_result_file = os.path.join(trainlog_dir, f'{config_id}_result_{timestamp}.json')
+        with open(config_result_file, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        logger.info(f"✅ 配置 {config_id} 的结果已保存到: {config_result_file}")
+    
     logger.info("=" * 100)
 
 
@@ -1120,6 +1392,25 @@ def run_dataset_comparison():
                         if test_success:
                             config_result['ner_metrics'] = ner_metrics
                             step_logger.info(f"✅ NER评估指标已提取: {ner_metrics}")
+                            
+                            # 添加数据源信息到NER评估指标
+                            ner_metrics_with_source = ner_metrics.copy()
+                            ner_metrics_with_source['data_source_info'] = {
+                                'config_id': config_id,
+                                'config_name': config_info['name'],
+                                'config_description': config_info['description'],
+                                'enabled_sources': {k: v for k, v in config_info['switches'].items() if v},
+                                'disabled_sources': {k: v for k, v in config_info['switches'].items() if not v}
+                            }
+                            
+                            # 保存NER评估指标到JSON文件
+                            ner_metrics_file = os.path.join(
+                                trainlog_dir,
+                                f"ner_metrics_{config_id}_{session_timestamp}.json"
+                            )
+                            with open(ner_metrics_file, 'w', encoding='utf-8') as f:
+                                json.dump(ner_metrics_with_source, f, ensure_ascii=False, indent=2)
+                            step_logger.info(f"✅ NER评估指标已保存到: {ner_metrics_file}")
                         else:
                             step_logger.warning(f"⚠️  NER模型测试失败，但继续执行")
                     
@@ -1134,20 +1425,36 @@ def run_dataset_comparison():
                         vectorize_success = vectorize_and_store_to_es(config_id)
                         if not vectorize_success:
                             step_logger.warning(f"⚠️  向量化失败，但继续执行")
+                        
+                        # 查询ES索引状态并保存到JSON
+                        step_logger.info("查询ES索引状态...")
+                        index_status = query_es_index_status(config_id)
+                        config_result['es_index_status'] = index_status
+                        
+                        # 保存索引状态到JSON文件
+                        status_file = os.path.join(
+                            trainlog_dir,
+                            f"es_index_status_{config_id}_{session_timestamp}.json"
+                        )
+                        with open(status_file, 'w', encoding='utf-8') as f:
+                            json.dump(index_status, f, ensure_ascii=False, indent=2)
+                        step_logger.info(f"✅ ES索引状态已保存到: {status_file}")
+                        step_logger.info(f"   索引名称: {index_status.get('index_name', 'N/A')}")
+                        step_logger.info(f"   文档总数: {index_status.get('document_count', 0)}")
                     
-                    # 7. 运行最终测试并提取评估指标
-                    with step_logger.step("步骤7: 运行最终测试并提取评估指标", log_file=config_log_file):
-                        final_test_success, search_metrics, search_output = run_final_test_with_config(config_id)
-                        if final_test_success:
-                            config_result['search_metrics'] = search_metrics
-                            step_logger.info(f"✅ 检索系统评估指标已提取")
-                            for mode, metrics in search_metrics.items():
-                                step_logger.info(f"  {mode}: MRR={metrics.get('mrr', 'N/A'):.4f}, Hit@1={metrics.get('hit@1', 'N/A'):.4f}")
-                        else:
-                            step_logger.warning(f"⚠️  最终测试失败")
+                    # 7. 运行最终测试并提取评估指标（已跳过，用户手动测试）
+                    # with step_logger.step("步骤7: 运行最终测试并提取评估指标", log_file=config_log_file):
+                    #     final_test_success, search_metrics, search_output = run_final_test_with_config(config_id)
+                    #     if final_test_success:
+                    #         config_result['search_metrics'] = search_metrics
+                    #         step_logger.info(f"✅ 检索系统评估指标已提取")
+                    #         for mode, metrics in search_metrics.items():
+                    #             step_logger.info(f"  {mode}: MRR={metrics.get('mrr', 'N/A'):.4f}, Hit@1={metrics.get('hit@1', 'N/A'):.4f}")
+                    #     else:
+                    #         step_logger.warning(f"⚠️  最终测试失败")
                     
                     config_result['success'] = True
-                    step_logger.info(f"\n✅ 配置 {config_id} 处理完成")
+                    step_logger.info(f"\n✅ 配置 {config_id} 处理完成（已跳过最终测试，请手动测试）")
                     
                 except Exception as e:
                     step_logger.error(f"\n❌ 配置 {config_id} 处理异常: {e}")
