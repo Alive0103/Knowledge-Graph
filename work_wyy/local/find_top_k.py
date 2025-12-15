@@ -18,6 +18,35 @@ from tqdm import tqdm
 import logging
 from datetime import datetime
 
+# 导入配置
+try:
+    from config import (
+        TRAINLOG_DIR,
+        ENTITY_WORDS_ZH_FILE,
+        ENTITY_WORDS_EN_FILE,
+        ZH_WIKI_FILE,
+        EN_WIKI_FILE,
+        MIN_TEXT_LENGTH,
+        MIN_ENTITY_LENGTH_ZH,
+        MIN_ENTITY_LENGTH_EN,
+        VECTOR_BATCH_SIZE,
+        USE_FINETUNED_FOR_VECTORIZATION
+    )
+except ImportError:
+    # 如果无法导入配置，使用默认值
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _parent_dir = os.path.dirname(_script_dir)
+    TRAINLOG_DIR = os.path.join(_parent_dir, 'trainlog')
+    ENTITY_WORDS_ZH_FILE = os.path.join(_parent_dir, 'data', 'entity_words_zh.jsonl')
+    ENTITY_WORDS_EN_FILE = os.path.join(_parent_dir, 'data', 'entity_words_en.jsonl')
+    ZH_WIKI_FILE = os.path.join(_parent_dir, 'data', 'zh_wiki_v2.jsonl')
+    EN_WIKI_FILE = os.path.join(_parent_dir, 'data', 'en_wiki_v3.jsonl')
+    MIN_TEXT_LENGTH = 2
+    MIN_ENTITY_LENGTH_ZH = 2
+    MIN_ENTITY_LENGTH_EN = 3
+    VECTOR_BATCH_SIZE = 64
+    USE_FINETUNED_FOR_VECTORIZATION = True
+
 # 添加父目录到路径，以便导入模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -39,12 +68,11 @@ except ImportError:
     sys.exit(1)
 
 # 创建 trainlog 文件夹（如果不存在）
-trainlog_dir = os.path.join(parent_dir, 'trainlog')
-os.makedirs(trainlog_dir, exist_ok=True)
+os.makedirs(TRAINLOG_DIR, exist_ok=True)
 
 # 设置日志（保存到 trainlog 文件夹）
-log_filename = os.path.join(trainlog_dir, f'extract_entity_words_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-console_log_file = os.path.join(trainlog_dir, f'find_top_k_console_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+log_filename = os.path.join(TRAINLOG_DIR, f'extract_entity_words_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+console_log_file = os.path.join(TRAINLOG_DIR, f'find_top_k_console_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,8 +131,8 @@ def extract_entity_words_from_text(text, lang='zh'):
         entity_words: 实体词列表
         entity_freq: 实体词频字典（每个实体出现1次）
     """
-    if not text or not isinstance(text, str) or len(text.strip()) < 2:
-        return [], {}  # 降低最小长度要求，允许短文本也提取实体
+    if not text or not isinstance(text, str) or len(text.strip()) < MIN_TEXT_LENGTH:
+        return [], {}  # 使用配置文件中的最小长度要求
     
     try:
         # 使用NER模型提取实体词
@@ -112,11 +140,11 @@ def extract_entity_words_from_text(text, lang='zh'):
             text, lang=lang, verbose=False
         )
         
-        # 过滤：只保留长度>=2的实体（中文）或长度>=3的实体（英文）
+        # 过滤：使用配置文件中的最小长度要求
         if lang == 'zh':
-            entity_words = [e for e in entity_words if len(e.strip()) >= 2]
+            entity_words = [e for e in entity_words if len(e.strip()) >= MIN_ENTITY_LENGTH_ZH]
         else:
-            entity_words = [e for e in entity_words if len(e.strip()) >= 3]
+            entity_words = [e for e in entity_words if len(e.strip()) >= MIN_ENTITY_LENGTH_EN]
         
         # 更新词频字典
         entity_freq = {e: 1 for e in entity_words}
@@ -148,7 +176,7 @@ def vectorize_entity_words_and_merge(entity_words, lang='zh', batch_size=32, mer
         # 使用批量向量生成（使用微调后的模型）
         vectors = batch_generate_vectors(
             entity_words,
-            use_finetuned=True,
+            use_finetuned=USE_FINETUNED_FOR_VECTORIZATION,  # 使用配置文件中的设置
             target_dim=1024,
             batch_size=batch_size
         )
@@ -247,7 +275,7 @@ def process_file(file_path, vectorize=True, batch_size=32):
                 
                 # 处理中文描述
                 zh_description = data.get("zh_description") or data.get("descriptions_zh", "")
-                if zh_description and len(zh_description.strip()) >= 2:  # 降低最小长度要求，允许短文本也提取实体
+                if zh_description and len(zh_description.strip()) >= MIN_TEXT_LENGTH:  # 使用配置文件中的最小长度要求
                     entity_words_zh, entity_freq_zh = extract_entity_words_from_text(
                         zh_description, lang='zh'
                     )
@@ -283,7 +311,7 @@ def process_file(file_path, vectorize=True, batch_size=32):
                 
                 # 处理英文描述
                 en_description = data.get("en_description") or data.get("descriptions_en", "")
-                if en_description and len(en_description.strip()) >= 2:  # 降低最小长度要求，允许短文本也提取实体
+                if en_description and len(en_description.strip()) >= MIN_TEXT_LENGTH:  # 使用配置文件中的最小长度要求
                     entity_words_en, entity_freq_en = extract_entity_words_from_text(
                         en_description, lang='en'
                     )
@@ -377,20 +405,20 @@ def main():
     # 注意：输出文件保存在当前目录（work_wyy/data），与 find_top_k.py 同一目录
     file_configs = [
         {
-            "input": os.path.join(current_dir, "zh_wiki_v2.jsonl"),
-            "output": os.path.join(current_dir, "entity_words_zh.jsonl"),  # 保存到 work_wyy/data 目录
+            "input": ZH_WIKI_FILE,
+            "output": ENTITY_WORDS_ZH_FILE,  # 使用配置文件中的路径
             "name": "中文"
         },
         {
-            "input": os.path.join(current_dir, "en_wiki_v3.jsonl"),
-            "output": os.path.join(current_dir, "entity_words_en.jsonl"),  # 保存到 work_wyy/data 目录
+            "input": EN_WIKI_FILE,
+            "output": ENTITY_WORDS_EN_FILE,  # 使用配置文件中的路径
             "name": "英文"
         }
     ]
     
-    # 参数设置
+    # 参数设置（使用配置文件中的值）
     vectorize = True  # 是否对实体词进行向量化
-    batch_size = 32   # 向量化批量处理大小
+    batch_size = VECTOR_BATCH_SIZE  # 使用配置文件中的批量处理大小
     
     processed_files = []
     

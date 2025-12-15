@@ -10,25 +10,28 @@ import time
 import logging
 from datetime import datetime
 
-# 处理导入问题：支持直接运行和作为模块导入
-# 先添加父目录到路径，以便导入es_client
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
+# 导入配置和ES客户端
 try:
-    # 尝试相对导入（作为模块导入时）
-    from ..es_client import es
-except (ImportError, ValueError):
-    # 直接运行时的导入方式
-    try:
-        from es_client import es
-    except ImportError:
-        entity_link_dir = os.path.join(parent_dir, 'work_wyy')
-        if entity_link_dir not in sys.path:
-            sys.path.insert(0, entity_link_dir)
-        from es_client import es
+    from config import (
+        ES_INDEX_NAME,
+        ENTITY_WORDS_ZH_FILE,
+        ENTITY_WORDS_EN_FILE,
+        TRAINLOG_DIR,
+        VECTOR_DIMS,
+        VECTOR_BATCH_SIZE,
+        USE_FINETUNED_FOR_VECTORIZATION
+    )
+    from es_client import es
+except ImportError:
+    # 如果无法导入配置，使用默认值
+    ES_INDEX_NAME = 'data2'
+    ENTITY_WORDS_ZH_FILE = None
+    ENTITY_WORDS_EN_FILE = None
+    TRAINLOG_DIR = None
+    VECTOR_DIMS = 1024
+    VECTOR_BATCH_SIZE = 64
+    USE_FINETUNED_FOR_VECTORIZATION = True
+    from es_client import es
 
 # 设置日志记录 - 同时输出到控制台和文件
 logger = logging.getLogger(__name__)
@@ -91,8 +94,8 @@ except Exception as e:
         print(f"❌ 模型加载失败: {e2}")
         exit(1)
 
-# ES索引名称
-INDEX_NAME = "data2"
+# ES索引名称（使用配置文件中的值）
+INDEX_NAME = ES_INDEX_NAME
 
 
 def create_vector_index():
@@ -1018,10 +1021,16 @@ if __name__ == "__main__":
     # 默认处理entity_words_zh.jsonl和entity_words_en.jsonl（预处理后的实体词文件）
     else:
         # 查找预处理后的实体词文件（由 find_top_k.py 生成）
-        target_files = [
-            "entity_words_zh.jsonl",  # 中文文件处理结果（NER提取的实体词）
-            "entity_words_en.jsonl"   # 英文文件处理结果（NER提取的实体词）
-        ]
+        # 优先使用配置文件中的路径
+        if ENTITY_WORDS_ZH_FILE and os.path.exists(ENTITY_WORDS_ZH_FILE):
+            target_files = [ENTITY_WORDS_ZH_FILE]
+        elif ENTITY_WORDS_EN_FILE and os.path.exists(ENTITY_WORDS_EN_FILE):
+            target_files = [ENTITY_WORDS_EN_FILE]
+        else:
+            target_files = [
+                "entity_words_zh.jsonl",  # 中文文件处理结果（NER提取的实体词）
+                "entity_words_en.jsonl"   # 英文文件处理结果（NER提取的实体词）
+            ]
         
         found_files = []
         for target_file in target_files:
