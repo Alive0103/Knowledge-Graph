@@ -1,0 +1,11 @@
+# Install torch separately according to your CPU/CUDA environment.
+numpy>=1.26
+pandas>=2.0
+openpyxl>=3.1
+tqdm>=4.66
+transformers>=4.45
+huggingface-hub>=0.24
+safetensors>=0.4
+sentencepiece>=0.2
+faiss-cpu>=1.7.4
+elasticsearch>=8.15
